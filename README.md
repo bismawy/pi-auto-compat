@@ -32,7 +32,7 @@ pi install npm:pi-auto-compat
 
 Then run `/reload` in Pi (or restart it). Optionally run `/auto-compat` once to fix everything immediately.
 
-Manual install (from source): copy `auto-compat.ts` into `%USERPROFILE%\.pi\agent\extensions\`.
+Manual install (from source): copy `index.ts` into `%USERPROFILE%\.pi\agent\extensions\`.
 
 ## Safety
 
