@@ -514,6 +514,7 @@ function scanTargets(ctx: ExtensionContext | undefined): RtModel[] {
 export default function autoCompat(pi: ExtensionAPI) {
 	let watcher: FSWatcher | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let widgetTimer: ReturnType<typeof setTimeout> | undefined;
 	let notifiedThisSession = false;
 	// Anti-loop guard: suggestions already written this session are not
 	// rewritten even if the registry refresh failed.
@@ -525,9 +526,14 @@ export default function autoCompat(pi: ExtensionAPI) {
 		kind: "info" | "warning" | "success" = "info",
 	) {
 		try {
-			// Show above the chat input (widget slot above editor), not the footer
-			// status bar and not the chat transcript.
-			ctx?.ui?.setWidget?.("auto-compat", [message]);
+			// Show above the chat input (widget slot above editor), prefixed so the
+			// source is clear, then auto-dismiss so it does not stay forever.
+			ctx?.ui?.setWidget?.("auto-compat", [`auto-compat: ${message}`]);
+			if (widgetTimer) clearTimeout(widgetTimer);
+			widgetTimer = setTimeout(() => {
+				widgetTimer = undefined;
+				ctx?.ui?.setWidget?.("auto-compat", undefined);
+			}, 10_000);
 		} catch {
 			// non-UI mode: ignore
 		}
