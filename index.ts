@@ -525,7 +525,10 @@ export default function autoCompat(pi: ExtensionAPI) {
 		kind: "info" | "warning" | "success" = "info",
 	) {
 		try {
-			ctx?.ui?.notify?.(`auto-compat: ${message}`, kind);
+			// pi-lens-ignore: no-console-except-error, console-statement
+			// Log to terminal instead of chat-area status line (ctx.ui.notify renders
+			// inside the chat, cluttering it at startup).
+			console.log(`[auto-compat] ${message}`);
 		} catch {
 			// non-UI mode: ignore
 		}
@@ -551,7 +554,7 @@ export default function autoCompat(pi: ExtensionAPI) {
 		);
 		if (!changed) return { changed, detail };
 
-		// Full detail goes to console only; the TUI gets one notice per session.
+		// Full detail goes to console only.
 		// pi-lens-ignore: no-console-except-error, console-statement
 		console.log(`[auto-compat] models.json fixed: ${detail.join(", ")}`);
 
