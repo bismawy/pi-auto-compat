@@ -32,6 +32,14 @@
  * target key is repaired in place (Pi precedence: modelOverrides >
  * models[] > provider).
  *
+ * Exception — extension-owned model lists: when an extension registers a
+ * provider with its own `models` array (or `refreshModels`), Pi composes
+ * that list AFTER models.json (provider-composer applyExtension replaces
+ * the model list wholesale), so provider-level compat and models[].compat
+ * never reach the merged model — only modelOverrides do (applied last via
+ * applyModelOverride/mergeCompat). Fixes for such providers are always
+ * written to modelOverrides.
+ *
  * After writing, the registry is refreshed in-process (modelRegistry.refresh)
  * so changes apply immediately without /reload. Triggers: session_start,
  * model_select, the models.json file-watcher, and the /auto-compat command.
@@ -366,6 +374,7 @@ function applyModelFix(
 	model: RtModel,
 	siblings: RtModel[],
 	suggestion: Compat,
+	forceOverride = false,
 ): string | undefined {
 	const providers = (cfg.providers ??= {}) as Record<string, ProviderEntry>;
 	const entry = (providers[model.provider] ??= {}); // minimal compat-only entry if absent
@@ -386,7 +395,12 @@ function applyModelFix(
 	const overrideCompat = overrides?.[model.id]?.compat;
 
 	const keys = Object.keys(suggestion);
-	const placement = decidePlacement(keys, siblings, modelEntry, overrideCompat);
+	// Provider-level compat never reaches the merged model when the provider's
+	// model list is owned by an extension — modelOverrides is the only layer
+	// that lands (see extensionOwnsModels).
+	const placement: "provider" | "model" | "override" = forceOverride
+		? "override"
+		: decidePlacement(keys, siblings, modelEntry, overrideCompat);
 
 	if (placement === "provider") {
 		const pc = (entry.compat ??= {});
@@ -394,7 +408,7 @@ function applyModelFix(
 		return `providers["${model.provider}"].compat += ${keys.join(", ")}`;
 	}
 
-	if (modelEntry) {
+	if (placement === "model" && modelEntry) {
 		const mc = (modelEntry.compat ??= {});
 		Object.assign(mc, suggestion);
 		return `providers["${model.provider}"].models["${model.id}"].compat += ${keys.join(", ")}`;
@@ -438,6 +452,7 @@ function applyThinkingLevelMaps(cfg: ModelsConfig): string[] {
 export function fixModelsConfig(
 	models: RtModel[],
 	siblingsByProvider?: Map<string, RtModel[]>,
+	forceOverrides?: (provider: string) => boolean,
 ): { changed: boolean; detail: string[] } {
 	const cfg = loadModelsConfig();
 	if (!cfg || !cfg.providers) return { changed: false, detail: [] };
@@ -450,7 +465,13 @@ export function fixModelsConfig(
 		if (!Object.keys(suggestion).length) continue;
 		const siblings =
 			siblingsByProvider?.get(lower(m.provider)) ?? [m];
-		const line = applyModelFix(cfg, m, siblings, suggestion);
+		const line = applyModelFix(
+			cfg,
+			m,
+			siblings,
+			suggestion,
+			forceOverrides?.(m.provider) ?? false,
+		);
 		if (line) detail.push(line);
 	}
 
@@ -463,14 +484,43 @@ export function fixModelsConfig(
 
 // ── Extension ───────────────────────────────────────────────────────
 
+// Sync subset of the ctx.modelRegistry facade this extension uses.
 interface RegistryLike {
 	getAll?: () => unknown[];
+	refresh?: (options?: { allowNetwork?: boolean }) => Promise<unknown>;
+	getRegisteredProviderConfig?: (provider: string) => unknown;
+}
+
+function registryOf(ctx: ExtensionContext | undefined): RegistryLike | undefined {
+	return (ctx as { modelRegistry?: RegistryLike } | undefined)?.modelRegistry;
+}
+
+/**
+ * True when an extension-registered provider supplies its own model list
+ * (`models` array now, or later via `refreshModels`). Pi's provider-composer
+ * applies such lists AFTER models.json (applyExtension replaces the model
+ * list wholesale), so provider-level compat and models[].compat are dropped
+ * from the merged model — only modelOverrides survive. Compat fixes for
+ * these providers must go to modelOverrides.
+ */
+function extensionOwnsModels(
+	registry: RegistryLike | undefined,
+	provider: string,
+): boolean {
+	try {
+		const cfg = registry?.getRegisteredProviderConfig?.(provider);
+		if (!cfg || typeof cfg !== "object") return false;
+		return (
+			Array.isArray((cfg as { models?: unknown }).models) ||
+			typeof (cfg as { refreshModels?: unknown }).refreshModels === "function"
+		);
+	} catch {
+		return false;
+	}
 }
 
 function registryModels(ctx: ExtensionContext | undefined): RtModel[] {
-	const registry = (ctx as { modelRegistry?: RegistryLike } | undefined)
-		?.modelRegistry;
-	const all = registry?.getAll?.() ?? [];
+	const all = registryOf(ctx)?.getAll?.() ?? [];
 	return all.filter((m): m is RtModel => !!m && typeof m === "object");
 }
 
@@ -520,23 +570,31 @@ export default function autoCompat(pi: ExtensionAPI) {
 	// rewritten even if the registry refresh failed.
 	const applied = new Set<string>();
 
-	function notify(
+function notify(
 		ctx: ExtensionContext | undefined,
 		message: string,
 		kind: "info" | "warning" | "success" = "info",
 	) {
+		// ctx getters throw once the session was replaced/reloaded (runner
+		// assertActive), so capture the ui object while the ctx is live and
+		// guard the deferred dismissal too — an escaped throw from a timer
+		// callback crashes Pi (uncaughtException).
+		let ui: ExtensionContext["ui"] | undefined;
 		try {
-			// Show above the chat input (widget slot above editor), prefixed so the
-			// source is clear, then auto-dismiss so it does not stay forever.
-			ctx?.ui?.setWidget?.("auto-compat", [`auto-compat: ${message}`]);
-			if (widgetTimer) clearTimeout(widgetTimer);
-			widgetTimer = setTimeout(() => {
-				widgetTimer = undefined;
-				ctx?.ui?.setWidget?.("auto-compat", undefined);
-			}, 10_000);
+			ui = ctx?.ui;
+			ui?.setWidget?.("auto-compat", [`auto-compat: ${message}`]);
 		} catch {
-			// non-UI mode: ignore
+			return; // stale or non-UI ctx: nothing to show or dismiss
 		}
+		if (widgetTimer) clearTimeout(widgetTimer);
+		widgetTimer = setTimeout(() => {
+			widgetTimer = undefined;
+			try {
+				ui?.setWidget?.("auto-compat", undefined);
+			} catch {
+				// session was replaced while the widget was up; nothing to dismiss
+			}
+		}, 10_000);
 	}
 
 	async function runFix(
@@ -553,9 +611,11 @@ export default function autoCompat(pi: ExtensionAPI) {
 		});
 		if (!targets.length) return { changed: false, detail: [] };
 
+		const registry = registryOf(ctx);
 		const { changed, detail } = fixModelsConfig(
 			targets,
 			groupByProvider(registryModels(ctx)),
+			(provider) => extensionOwnsModels(registry, provider),
 		);
 		if (!changed) return { changed, detail };
 
@@ -564,7 +624,7 @@ export default function autoCompat(pi: ExtensionAPI) {
 
 		let refreshed = true;
 		try {
-			await ctx.modelRegistry?.refresh?.({ allowNetwork: false });
+			await registry?.refresh?.({ allowNetwork: false });
 		} catch {
 			refreshed = false;
 		}
@@ -581,11 +641,24 @@ export default function autoCompat(pi: ExtensionAPI) {
 		return { changed: true, detail };
 	}
 
+	// Every ctx getter (ui, modelRegistry, model, …) throws once the session
+	// was replaced or reloaded (runner assertActive). Deferred calls (debounce
+	// timer, file watcher, startup) may fire with a stale captured ctx — never
+	// let that throw escape or reject a floating promise.
+	function runFixSafe(ctx: ExtensionContext, models?: RtModel[]): void {
+		try {
+			const list = models ?? scanTargets(ctx);
+			runFix(ctx, list).catch(() => undefined);
+		} catch {
+			// stale ctx — the new session's session_start re-runs the fix
+		}
+	}
+
 	function scheduleFix(ctx: ExtensionContext) {
 		if (timer) clearTimeout(timer);
 		timer = setTimeout(() => {
 			timer = undefined;
-			void runFix(ctx, scanTargets(ctx));
+			runFixSafe(ctx);
 		}, 800);
 	}
 
@@ -593,7 +666,7 @@ export default function autoCompat(pi: ExtensionAPI) {
 		stopWatcher();
 		notifiedThisSession = false;
 		applied.clear();
-		void runFix(ctx, scanTargets(ctx)); // check once at startup
+		runFixSafe(ctx); // check once at startup
 
 		try {
 			watcher = watch(
@@ -613,6 +686,10 @@ export default function autoCompat(pi: ExtensionAPI) {
 			clearTimeout(timer);
 			timer = undefined;
 		}
+		if (widgetTimer) {
+			clearTimeout(widgetTimer);
+			widgetTimer = undefined;
+		}
 		if (watcher) {
 			try {
 				watcher.close();
@@ -629,7 +706,7 @@ export default function autoCompat(pi: ExtensionAPI) {
 
 	pi.on("model_select", (event, ctx) => {
 		const model = (event as { model?: RtModel } | undefined)?.model;
-		if (model) void runFix(ctx, [model]);
+		if (model) runFixSafe(ctx, [model]);
 	});
 
 	pi.on("session_shutdown", () => {
