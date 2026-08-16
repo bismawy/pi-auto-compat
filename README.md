@@ -26,13 +26,13 @@ Detection mirrors [pi-cache-optimizer](https://www.npmjs.com/package/pi-cache-op
 
 ## Install
 
-Copy `auto-compat.ts` into your Pi agent extensions directory:
-
 ```
-%USERPROFILE%\.pi\agent\extensions\auto-compat.ts
+pi install npm:pi-auto-compat
 ```
 
 Then run `/reload` in Pi (or restart it). Optionally run `/auto-compat` once to fix everything immediately.
+
+Manual install (from source): copy `auto-compat.ts` into `%USERPROFILE%\.pi\agent\extensions\`.
 
 ## Safety
 
