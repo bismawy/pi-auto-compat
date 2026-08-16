@@ -525,9 +525,9 @@ export default function autoCompat(pi: ExtensionAPI) {
 		kind: "info" | "warning" | "success" = "info",
 	) {
 		try {
-			// Render in the footer/status bar (like the git branch/ponytail indicators),
-			// not the chat area. setStatus is a persistent dim line in the status bar.
-			ctx?.ui?.setStatus?.("auto-compat", message);
+			// Show above the chat input (widget slot above editor), not the footer
+			// status bar and not the chat transcript.
+			ctx?.ui?.setWidget?.("auto-compat", [message]);
 		} catch {
 			// non-UI mode: ignore
 		}
@@ -553,8 +553,8 @@ export default function autoCompat(pi: ExtensionAPI) {
 		);
 		if (!changed) return { changed, detail };
 
-		// No chat/console output — the status is shown via ctx.ui.setStatus() in the
-		// footer status bar, set by the notify() call below.
+		// No chat/console output — the status is shown via ctx.ui.setWidget() above
+		// the chat input, set by the notify() call below.
 
 		let refreshed = true;
 		try {
