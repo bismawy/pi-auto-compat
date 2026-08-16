@@ -20,6 +20,7 @@ Detection mirrors [pi-cache-optimizer](https://www.npmjs.com/package/pi-cache-op
 ## How it works
 
 - Fix placement mirrors pi-cache-optimizer `/fix`: channel keys (affinity/retention) go provider-level; model-behavior keys go model-level (`models[].compat` or `modelOverrides`) unless every sibling model is compatible.
+- **Extension-owned providers are special-cased**: when an extension registers a provider with its own `models` list (or `refreshModels`), Pi applies that list *after* models.json, so provider-level `compat` and `models[].compat` never reach the merged model — only `modelOverrides` do. All fixes for such providers are therefore written to `modelOverrides` (detected via `ctx.modelRegistry.getRegisteredProviderConfig`).
 - After writing, the registry is refreshed **in-process** (`modelRegistry.refresh({ allowNetwork: false })`) — no `/reload` needed.
 - Triggers: `session_start`, `model_select`, the `models.json` file-watcher, and the manual `/auto-compat` command.
 - A timestamped backup is written before each save (max 3 kept).
