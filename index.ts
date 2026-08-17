@@ -537,14 +537,17 @@ function groupByProvider(models: RtModel[]): Map<string, RtModel[]> {
 
 /**
  * Scan targets: all registry models of providers that already have a
- * models.json entry (channels the user opted into) + the active model of any
- * provider. Models of providers without an entry get patched when selected/
- * active — no entries are created for dozens of unused built-in providers.
+ * models.json entry (channels the user opted into) OR whose model list is
+ * owned by an extension (registered provider with its own `models` /
+ * `refreshModels`), + the active model of any provider. Models of other
+ * providers (built-in catalog proxies) get patched when selected/active — no
+ * entries are created for dozens of unused built-in providers.
  */
 function scanTargets(ctx: ExtensionContext | undefined): RtModel[] {
 	const known = new Set(
 		Object.keys(loadModelsConfig()?.providers ?? {}).map(lower),
 	);
+	const registry = registryOf(ctx);
 	const seen = new Set<string>();
 	const out: RtModel[] = [];
 	const push = (m: RtModel | undefined): void => {
@@ -555,7 +558,7 @@ function scanTargets(ctx: ExtensionContext | undefined): RtModel[] {
 		out.push(m);
 	};
 	for (const m of registryModels(ctx)) {
-		if (known.has(lower(m.provider))) push(m);
+		if (known.has(lower(m.provider)) || extensionOwnsModels(registry, m.provider)) push(m);
 	}
 	push(ctx?.model as RtModel | undefined);
 	return out;
