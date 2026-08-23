@@ -7,6 +7,11 @@
  * so every source of the ⚠️ compat footer marker / model_select warnings
  * is covered:
  *
+ *   0. UNIVERSAL: every model/provider gets supportsLongCacheRetention: true
+ *      when not explicitly set (pi defaults it to true; declaring it makes the
+ *      "Caching" badge / cache-optimizer warning surface). Explicit false is
+ *      respected; built-in llama.cpp is excluded. New models added via
+ *      /better-custom are covered automatically — no per-model injection.
  *   1. Adaptive generation (api anthropic-messages + Opus/Sonnet >= 4.6,
  *      Fable >= 5, or Kimi Coding K3 channel)
  *      → forceAdaptiveThinking: true (+ allowEmptySignature for K3 empty-sig)
@@ -198,6 +203,16 @@ function suggestCompat(m: RtModel): Compat {
 	const tokens = tokensOf(m);
 	const out: Compat = {};
 
+	// 0. Universal long cache retention.
+	// pi defaults supportsLongCacheRetention to true, but the Caching badge and
+	// the cache-optimizer warning only surface when it is declared explicitly.
+	// Declare it for every model/provider (except the built-in llama.cpp and any
+	// that explicitly opt out with false) so newly added models — e.g. via
+	// /better-custom — get caching automatically without per-model injection.
+	if (compat.supportsLongCacheRetention === undefined && !isPiBuiltInLlamaCpp(m)) {
+		out.supportsLongCacheRetention = true;
+	}
+
 	// 1. Adaptive thinking (only relevant on anthropic-messages).
 	if (
 		lower(api) === "anthropic-messages" &&
@@ -211,8 +226,6 @@ function suggestCompat(m: RtModel): Compat {
 
 	// 2. DeepSeek-like on OpenAI-compatible APIs.
 	if (isDeepSeekLike(tokens) && isOpenAICompatibleApi(api) && !isPiBuiltInLlamaCpp(m)) {
-		if (compat.supportsLongCacheRetention !== true)
-			out.supportsLongCacheRetention = true;
 		if (
 			lower(api) === "openai-completions" &&
 			compat.sendSessionAffinityHeaders === undefined

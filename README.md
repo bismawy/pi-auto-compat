@@ -6,6 +6,7 @@ Detection mirrors [pi-cache-optimizer](https://www.npmjs.com/package/pi-cache-op
 
 ## What it fixes
 
+0. **Universal long cache retention** — every model/provider gets `supportsLongCacheRetention: true` when not explicitly set (pi already defaults it to `true`; declaring it surfaces the "Caching" badge and silences the cache-optimizer warning). Explicit `false` is respected; Pi's built-in llama.cpp is excluded. New models added via `/better-custom` are covered automatically — no per-model injection needed.
 1. **Adaptive generation** (`anthropic-messages` + Opus/Sonnet ≥ 4.6, Fable ≥ 5, or Kimi Coding K3)
    → `forceAdaptiveThinking: true` (+ `allowEmptySignature` for K3 empty-signature models)
 2. **DeepSeek-like** (`openai-completions` / `openai-responses`)
