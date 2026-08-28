@@ -1,9 +1,10 @@
 {
-  "name": "pi-auto-compat",
+  "name": "@bismawy/pi-auto-compat",
   "version": "1.4.0",
-  "description": "Auto-fix missing compat flags in Pi's models.json \u2014 mirrors pi-cache-optimizer detection so compat warnings never appear. Registry-driven, credential-safe, refreshes in-process.",
+  "description": "Auto-fix missing compat flags in Pi's models.json — mirrors pi-cache-optimizer detection so compat warnings never appear. Registry-driven, credential-safe, refreshes in-process.",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "pi",
     "pi-coding-agent",
     "compat",
@@ -13,6 +14,9 @@
   ],
   "author": "bismawy",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "index.ts"
   ],

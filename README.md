@@ -29,7 +29,7 @@ Detection mirrors [pi-cache-optimizer](https://www.npmjs.com/package/pi-cache-op
 ## Install
 
 ```
-pi install npm:pi-auto-compat
+pi install npm:@bismawy/pi-auto-compat
 ```
 
 Then run `/reload` in Pi (or restart it). Optionally run `/auto-compat` once to fix everything immediately.
