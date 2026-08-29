@@ -8,7 +8,7 @@ Silently detects and patches missing model compatibility flags in `models.json` 
 [![npm](https://img.shields.io/npm/v/@bismawy/pi-auto-compat)](https://www.npmjs.com/package/@bismawy/pi-auto-compat)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-![pi-auto-compat](./assets/screenshot.webp)
+![pi-auto-compat](./assets/screenshot.png)
 
 ---
 
