@@ -24,7 +24,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/screenshot.png"
+    "image": "https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/screenshot.webp"
   },
   "imports": {
     "#extension": "./index.ts"
