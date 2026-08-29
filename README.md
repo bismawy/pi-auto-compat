@@ -1,5 +1,7 @@
 # pi-auto-compat
 
+![pi-auto-compat](./assets/screenshot.webp)
+
 A [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) extension that automatically fixes missing `compat` flags in `models.json` — so warnings like `💡 pi-cache-optimizer: ... merged compat lacks ...` and the `⚠️ compat` footer marker never appear.
 
 Detection mirrors [pi-cache-optimizer](https://www.npmjs.com/package/pi-cache-optimizer) exactly (same priority chain), and the source of truth is the **merged** model list from `ctx.modelRegistry` — not a static file scan. Providers without a `models.json` entry are patched too (a minimal compat-only entry is created; credentials are never touched).
