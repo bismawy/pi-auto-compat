@@ -1,6 +1,6 @@
 {
   "name": "@bismawy/pi-auto-compat",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Auto-fix missing compat flags in Pi's models.json — mirrors pi-cache-optimizer detection so compat warnings never appear. Registry-driven, credential-safe, refreshes in-process.",
   "keywords": [
     "pi-package",
