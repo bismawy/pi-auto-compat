@@ -7,10 +7,12 @@
  * so every source of the ⚠️ compat footer marker / model_select warnings
  * is covered:
  *
- *   0. UNIVERSAL: every model/provider gets supportsLongCacheRetention: true
- *      when not explicitly set (pi defaults it to true; declaring it makes the
- *      "Caching" badge / cache-optimizer warning surface). Explicit false is
- *      respected; built-in llama.cpp is excluded. New models added via
+ *   0. UNIVERSAL: every model/provider gets an explicit supportsLongCacheRetention
+ *      when not explicitly set — true only for Anthropic-messages and official
+ *      OpenAI (the channels that reliably accept long cache retention), false
+ *      for other OpenAI-compatible channels (some, e.g. Fireworks, 400 on
+ *      prompt_cache_retention; pi's implicit default is true, so omission is
+ *      not safe). Explicit user values are respected. New models added via
  *      /better-custom are covered automatically — no per-model injection.
  *   1. Adaptive generation (api anthropic-messages + Opus/Sonnet >= 4.6,
  *      Fable >= 5, or Kimi Coding K3 channel)
@@ -203,14 +205,17 @@ function suggestCompat(m: RtModel): Compat {
 	const tokens = tokensOf(m);
 	const out: Compat = {};
 
-	// 0. Universal long cache retention.
-	// pi defaults supportsLongCacheRetention to true, but the Caching badge and
-	// the cache-optimizer warning only surface when it is declared explicitly.
-	// Declare it for every model/provider (except the built-in llama.cpp and any
-	// that explicitly opt out with false) so newly added models — e.g. via
-	// /better-custom — get caching automatically without per-model injection.
-	if (compat.supportsLongCacheRetention === undefined && !isPiBuiltInLlamaCpp(m)) {
-		out.supportsLongCacheRetention = true;
+	// 0. Long cache retention — universal, no provider-name special cases.
+	// Anthropic natively supports 1h cache TTL; official OpenAI accepts
+	// prompt_cache_retention. Other OpenAI-compatible channels may 400 on it
+	// (e.g. Fireworks uses automatic prompt caching). pi defaults this to true
+	// when undeclared, so declare it explicitly to make the effective value
+	// deterministic. Explicit user values are respected (checked above);
+	// built-in llama.cpp is not official OpenAI and correctly gets false —
+	// it has no retention parameter either.
+	if (compat.supportsLongCacheRetention === undefined) {
+		out.supportsLongCacheRetention =
+			lower(api) === "anthropic-messages" || isOfficialOpenAI(m);
 	}
 
 	// 1. Adaptive thinking (only relevant on anthropic-messages).
