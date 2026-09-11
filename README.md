@@ -4,7 +4,7 @@
 
 Automatic `compat` flags self-healer for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent) — patches missing model compatibility flags in `models.json` in-process, so caching, adaptive reasoning, and proxies just work.
 
-[pi package](https://github.com/earendil-works/pi-coding-agent) · [npm](https://www.npmjs.com/package/@bismawy/pi-auto-compat) · [Issues](https://github.com/bismawy/pi-auto-compat/issues)
+[pi package](https://pi.dev/packages/@bismawy/pi-auto-compat) · [npm](https://www.npmjs.com/package/@bismawy/pi-auto-compat) · [Issues](https://github.com/bismawy/pi-auto-compat/issues)
 
 ![npm](https://img.shields.io/npm/v/@bismawy/pi-auto-compat)
 ![license](https://img.shields.io/badge/license-MIT-green)
