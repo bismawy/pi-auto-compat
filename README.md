@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="assets/screenshot.webp" alt="pi-auto-compat" width="100%">
-
 # pi-auto-compat
 
 Automatic `compat` flags self-healer for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent) — patches missing model compatibility flags in `models.json` in-process, so caching, adaptive reasoning, and proxies just work.
@@ -12,6 +10,8 @@ Automatic `compat` flags self-healer for the [pi coding agent](https://github.co
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 </div>
+
+<img src="assets/screenshot.webp" alt="pi-auto-compat" width="100%">
 
 ## What it does
 
