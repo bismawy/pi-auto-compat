@@ -11,8 +11,6 @@ Automatic `compat` flags self-healer for the [pi coding agent](https://github.co
 
 </div>
 
-<img src="assets/screenshot.webp" alt="pi-auto-compat" width="100%">
-
 ## What it does
 
 Missing `compat` flags are the reason prompt caching silently fails, adaptive thinking doesn't kick in, or proxy sessions break. pi-auto-compat detects them and patches `models.json` automatically — no manual JSON editing, no compat warnings.
