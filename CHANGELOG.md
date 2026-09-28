@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Standardized layout following `arnative-pi` contract: moved extension entry point to `extensions/index.ts`.
 - Manifest update: enabled `"type": "module"`, updated `"files"` to include `extensions`, `CHANGELOG.md`, `LICENSE`, and `README.md`.
 - Updated package card preview image in `package.json` to `assets/banner.webp`.
-- Restructured `README.md` to mirror `pi-arnative` design: minimal shieldcn outline badges, markdown banner image, structured feature overview, clean command tables, and collapsible architecture accordions.
+- Restructured `README.md` to mirror `pi-arnative` design: minimal shieldcn outline badges, full-width responsive banner image (`width="100%"`), structured feature overview, clean command tables, and collapsible architecture accordions.
 
 ---
 

@@ -6,7 +6,7 @@ In-process model compatibility flags self-healer. Built for Pi.
 [![badge](https://shieldcn.dev/npm/@bismawy/pi-auto-compat.svg?variant=outline&size=xs)](https://www.npmjs.com/package/@bismawy/pi-auto-compat)
 [![license](https://shieldcn.dev/github/bismawy/pi-auto-compat/license.svg?variant=outline&size=xs)](https://github.com/bismawy/pi-auto-compat)
 
-![pi-auto-compat](https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/banner.webp)
+<img src="https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/banner.webp" alt="Auto Compat: in-process model compatibility flags self-healer" width="100%">
 
 ## Overview
 
