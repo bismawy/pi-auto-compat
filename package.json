@@ -1,6 +1,7 @@
 {
   "name": "@bismawy/pi-auto-compat",
   "version": "1.4.3",
+  "type": "module",
   "description": "Auto-fix missing compat flags in Pi's models.json — mirrors pi-cache-optimizer detection so compat warnings never appear. Registry-driven, credential-safe, refreshes in-process.",
   "keywords": [
     "pi-package",
@@ -14,27 +15,34 @@
   ],
   "author": "bismawy",
   "license": "MIT",
+  "scripts": {
+    "dev": "pi -e ./extensions/index.ts",
+    "test": "node --test"
+  },
   "publishConfig": {
     "access": "public"
   },
   "files": [
-    "index.ts",
-    "assets"
+    "extensions",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md"
   ],
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ],
-    "image": "https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/screenshot.webp"
-  },
-  "imports": {
-    "#extension": "./index.ts"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bismawy/pi-auto-compat.git"
+  },
+  "homepage": "https://github.com/bismawy/pi-auto-compat#readme",
+  "bugs": {
+    "url": "https://github.com/bismawy/pi-auto-compat/issues"
+  },
+  "pi": {
+    "image": "https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/banner.webp",
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

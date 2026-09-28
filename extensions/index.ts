@@ -199,7 +199,7 @@ function isOfficialOpenAI(m: RtModel): boolean {
  * only set when undefined (explicit false = anti-403 opt-out; see the
  * comment on describeMissingOpenAICompatibleProxyCompat in cache-optimizer).
  */
-function suggestCompat(m: RtModel): Compat {
+export function suggestCompat(m: RtModel): Compat {
 	const api = lower(m.api);
 	const compat = m.compat ?? {};
 	const tokens = tokensOf(m);
@@ -582,6 +582,110 @@ function scanTargets(ctx: ExtensionContext | undefined): RtModel[] {
 	return out;
 }
 
+// ── Windows Cache-Optimizer Atomic-Rename Fix ─────────────────────────
+
+const SAFE_RENAME_BLOCK = String.raw`async function safeAtomicRename(tempPath: string, destPath: string, maxRetries = 5): Promise<void> {
+  try {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        await rename(tempPath, destPath);
+        return;
+      } catch (err: any) {
+        const code = err?.code;
+        if ((code === "EPERM" || code === "EBUSY" || code === "EACCES") && i < maxRetries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25 * (i + 1)));
+          continue;
+        }
+        try {
+          await copyFile(tempPath, destPath);
+          return;
+        } catch {
+          throw err;
+        }
+      }
+    }
+  } finally {
+    await unlink(tempPath).catch(() => {});
+  }
+}
+
+async function writeStatsShardV7(path: string, shard: PersistedStatsShardV7): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = path + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
+  await writeFile(tempPath, JSON.stringify(shard, null, 2) + "\n", "utf8");
+  await safeAtomicRename(tempPath, path);
+}`;
+const SHARD_PATTERN =
+	/async function writeStatsShardV7\([^)]*\)[^{]*\{[\s\S]*?\n\}/;
+
+// A previously generated patch could corrupt the `+"\n"` escape into a real
+// newline, producing a file that no longer parses. Detect it so we overwrite
+// the whole safeAtomicRename region instead of trusting the marker alone.
+const BROKEN_ESCAPE = /\+\s*"\s*\r?\n/;
+
+/**
+ * On Windows, NTFS/Win32 rename throws EPERM/EBUSY if the destination shard
+ * is briefly held open by a reader (e.g. concurrent Pi process or scanner),
+ * triggering "Warning: pi-cache-optimizer: failed to persist footer stats".
+ * Patch writeStatsShardV7 in pi-cache-optimizer to use safeAtomicRename
+ * (retry with backoff + copyFile fallback) and clean up orphaned .tmp shards.
+ */
+export function patchCacheOptimizerWindows(): boolean {
+	if (process.platform !== "win32") return false;
+
+	const targetPath = join(
+		getAgentDir(),
+		"npm/node_modules/pi-cache-optimizer/index.ts",
+	);
+	let patched = false;
+	try {
+		if (existsSync(targetPath)) {
+			const content = readFileSync(targetPath, "utf8");
+			const corrupted = BROKEN_ESCAPE.test(content);
+			const hasSafe = content.includes("safeAtomicRename");
+
+			if (corrupted && hasSafe) {
+				// Overwrite the whole broken region with the known-good block.
+				const region = /async function safeAtomicRename[\s\S]*?async function writeStatsShardV7\([^)]*\)[^{]*\{[\s\S]*?\n\}/;
+				if (region.test(content)) {
+					writeFileSync(targetPath, content.replace(region, SAFE_RENAME_BLOCK), "utf8");
+					patched = true;
+				}
+			} else if (!hasSafe && SHARD_PATTERN.test(content)) {
+				writeFileSync(targetPath, content.replace(SHARD_PATTERN, SAFE_RENAME_BLOCK), "utf8");
+				patched = true;
+			}
+		}
+	} catch {
+		// Non-fatal if target is read-only or temporarily unavailable.
+	}
+
+	// Clean up any stale orphaned .tmp files in shards directory
+	try {
+		const shardsDir = join(
+			getAgentDir(),
+			"pi-cache-optimizer-stats.d",
+			"shards",
+		);
+		if (existsSync(shardsDir)) {
+			const files = readdirSync(shardsDir);
+			for (const file of files) {
+				if (file.endsWith(".tmp")) {
+					try {
+						unlinkSync(join(shardsDir, file));
+					} catch {
+						// ignore if currently locked
+					}
+				}
+			}
+		}
+	} catch {
+		// ignore
+	}
+
+	return patched;
+}
+
 export default function autoCompat(pi: ExtensionAPI) {
 	let watcher: FSWatcher | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -722,6 +826,7 @@ function notify(
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		patchCacheOptimizerWindows();
 		startWatcher(ctx);
 	});
 
@@ -746,7 +851,11 @@ function notify(
 					applied.delete(`${lower(m.provider)}\0${m.id}\0${keys.join(",")}`);
 			}
 			const { changed, detail } = await runFix(ctx, targets);
-			if (changed) {
+			const patched = patchCacheOptimizerWindows();
+			if (patched) {
+				detail.push("pi-cache-optimizer Windows file-lock patch applied");
+			}
+			if (changed || patched) {
 				notify(ctx, `fixed:\n  - ${detail.join("\n  - ")}`, "success");
 				return;
 			}

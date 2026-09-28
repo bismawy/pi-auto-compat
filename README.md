@@ -1,24 +1,23 @@
-<div align="center">
+# Auto Compat
 
-# pi-auto-compat
+In-process model compatibility flags self-healer. Built for Pi.
 
-Automatic `compat` flags self-healer for the [pi coding agent](https://github.com/earendil-works/pi-coding-agent) — patches missing model compatibility flags in `models.json` in-process, so caching, adaptive reasoning, and proxies just work.
+[![Custom badge](https://shieldcn.dev/badge/pi-%20Packages.svg?variant=outline&size=xs&logo=ri%3APiPiBold)](https://pi.dev/packages/@bismawy/pi-auto-compat)
+[![badge](https://shieldcn.dev/npm/@bismawy/pi-auto-compat.svg?variant=outline&size=xs)](https://www.npmjs.com/package/@bismawy/pi-auto-compat)
+[![license](https://shieldcn.dev/github/bismawy/pi-auto-compat/license.svg?variant=outline&size=xs)](https://github.com/bismawy/pi-auto-compat)
 
-[pi package](https://pi.dev/packages/@bismawy/pi-auto-compat) · [npm](https://www.npmjs.com/package/@bismawy/pi-auto-compat) · [Issues](https://github.com/bismawy/pi-auto-compat/issues)
+![pi-auto-compat](https://raw.githubusercontent.com/bismawy/pi-auto-compat/main/assets/banner.webp)
 
-![npm](https://img.shields.io/npm/v/@bismawy/pi-auto-compat)
-![license](https://img.shields.io/badge/license-MIT-green)
+## Overview
 
-</div>
+Missing `compat` flags cause prompt caching to fail silently, adaptive reasoning to stall, or proxy sessions to break. pi-auto-compat inspects active models and patches `models.json` automatically in-process — no manual editing, no restart loops, and no compatibility warnings.
 
-## What it does
-
-Missing `compat` flags are the reason prompt caching silently fails, adaptive thinking doesn't kick in, or proxy sessions break. pi-auto-compat detects them and patches `models.json` automatically — no manual JSON editing, no compat warnings.
-
-- **Auto-heals on the fly:** runs on `session_start`, `model_select`, and watches `models.json` for changes in real time.
-- **In-process refresh:** applies updates via `modelRegistry.refresh()` — no session restart needed.
-- **Aligned with `pi-cache-optimizer`:** mirrors the same detection rules, configuring long prompt caching, adaptive thinking (Claude 4.6+, Fable 5, Kimi K3), DeepSeek reasoning headers, session affinity, and thinking level maps for unmapped reasoning models.
-- **Credential-safe:** only touches `compat` and `modelOverrides`. Never reads or writes API keys, tokens, or base URLs. Timestamped backups (max 3) before every write.
+- **Auto-Heals On The Fly:** Intercepts `session_start` and `model_select`, and watches `models.json` for live changes.
+- **In-Process Refresh:** Invokes `modelRegistry.refresh()` immediately upon write, hot-reloading configurations without restarting Pi.
+- **Cache-Optimizer Parity:** Full alignment with `pi-cache-optimizer` rules for 1-hour cache retention, adaptive generation, proxy anthropic cache control, and session affinity.
+- **Reasoning Map Synthesis:** Synthesizes standard `{ low, medium, high, xhigh }` `thinkingLevelMap` entries for unmapped reasoning models.
+- **Windows Lock Resilience:** Patches `pi-cache-optimizer` with retry and fallback atomic rename to prevent Win32/NTFS `EPERM`/`EBUSY` shard write collisions.
+- **Credential-Safe & Backed Up:** Touches only `compat` and `modelOverrides`. Preserves explicit user settings, leaves API keys intact, and rotates up to 3 timestamped backups.
 
 ## Install
 
@@ -26,37 +25,70 @@ Missing `compat` flags are the reason prompt caching silently fails, adaptive th
 pi install npm:@bismawy/pi-auto-compat
 ```
 
-Then run `/reload` in your Pi session (or restart Pi). Verify anytime with `/auto-compat`.
+To test locally without installing:
+```bash
+pi -e ./extensions/index.ts
+```
 
-## How it works
+## Commands
+
+| Command | Scope | Action |
+| --- | --- | --- |
+| `/auto-compat` | Global | Audit active models, patch missing flags in `models.json`, and refresh the registry |
+
+> **Notes:**
+> - **Zero-Config Background Run:** Fixes are applied automatically on session launch and when switching models.
+> - **Explicit Settings Honored:** If you have explicitly configured a compat flag (even `false`), pi-auto-compat will never overwrite it.
+
+## Architecture
 
 <details>
-<summary><b>Compatibility rules</b></summary>
+<summary><b>Compatibility Detection Rules</b></summary>
 
-| Category | Conditions | Applied flags |
-| :--- | :--- | :--- |
-| Universal cache retention | All models where unset (except built-in llama.cpp) | `supportsLongCacheRetention: true` |
-| Adaptive generation | `anthropic-messages` + Opus/Sonnet ≥ 4.6, Fable ≥ 5, Kimi K3 | `forceAdaptiveThinking: true`, `allowEmptySignature: true` (K3) |
-| DeepSeek-like models | `openai-completions` / `openai-responses` matching DeepSeek | `requiresReasoningContentOnAssistantMessages`, `thinkingFormat: "deepseek"`, session affinity |
-| Claude on proxies | Claude models on OpenAI-compatible proxies | `cacheControlFormat: "anthropic"` |
-| OpenAI-compatible proxies | Custom `openai-completions` endpoints | `sendSessionAffinityHeaders: true` (when undefined) |
-| Unmapped reasoning | Reasoning models without declared thinking maps | `{ low, medium, high, xhigh }` thinkingLevelMap |
+| Category | Conditions | Applied Flags |
+| --- | --- | --- |
+| **Universal Cache Retention** | All models where unset (except built-in llama.cpp) | `supportsLongCacheRetention: true` (Anthropic & official OpenAI), `false` (third-party OpenAI-compatible) |
+| **Adaptive Generation** | `anthropic-messages` + Opus/Sonnet ≥ 4.6, Fable ≥ 5, Kimi K3 | `forceAdaptiveThinking: true`, `allowEmptySignature: true` (Kimi K3) |
+| **DeepSeek Reasoning** | `openai-completions` / `openai-responses` matching DeepSeek | `requiresReasoningContentOnAssistantMessages: true`, `thinkingFormat: "deepseek"`, session affinity |
+| **Claude on Proxies** | Claude models on OpenAI-compatible proxies | `cacheControlFormat: "anthropic"` |
+| **OpenAI-Compatible Proxies** | Custom `openai-completions` endpoints | `sendSessionAffinityHeaders: true` (when undefined) |
+| **Unmapped Reasoning** | Reasoning models without declared thinking maps | Declares standard `{ low, medium, high, xhigh }` `thinkingLevelMap` |
 
 </details>
 
 <details>
-<summary><b>Placement strategy</b></summary>
+<summary><b>Placement Strategy</b></summary>
 
-- Channel-level parameters (session affinity, cache retention) go to the provider level; model-specific flags go under `models[].compat` or `modelOverrides`.
-- When an extension registers custom providers with dynamic model lists, fixes are directed into `modelOverrides` so they take precedence over `models.json`.
+- **Provider-Level Settings:** Channel-wide parameters like session affinity and default cache retention are written directly to provider blocks.
+- **Model-Level Overrides:** Model-specific flags go under `models[].compat`. When external extensions register dynamic providers, fixes are directed into `modelOverrides` so they take precedence cleanly.
 
 </details>
 
 <details>
-<summary><b>Safety</b></summary>
+<summary><b>Windows File-Lock Resilience</b></summary>
 
-- Never inspects or alters credentials — only additive `compat` patches. Existing values, including explicit `false`, are preserved.
-- Rotates up to 3 timestamped backups (`models.json.backup.*`) before saving.
+On Windows, NTFS briefly locks destination files during concurrent background reads or terminal polling, which can cause `pi-cache-optimizer` stats shard writes to throw `EPERM`/`EBUSY`.
+
+- Wraps `writeStatsShardV7` in `pi-cache-optimizer` with `safeAtomicRename` (exponential backoff retry + copy fallback).
+- Cleans up orphaned `.tmp` shard files in `pi-cache-optimizer-stats.d/shards/` automatically on session start.
+
+</details>
+
+<details>
+<summary><b>Safety & Backups</b></summary>
+
+- **Read-Only API Keys:** Never inspects, logs, or alters credentials or base URLs.
+- **Rotating Backups:** Automatically rotates up to 3 timestamped backups (`models.json.backup.<timestamp>`) before committing modifications.
+
+</details>
+
+<details>
+<summary><b>Development</b></summary>
+
+```bash
+npm test    # Run unit tests verifying compat flag rules
+npm run dev # Launch local Pi instance with auto-compat active
+```
 
 </details>
 
@@ -64,6 +96,6 @@ Then run `/reload` in your Pi session (or restart Pi). Verify anytime with `/aut
 
 Distributed under the **MIT** license.
 
-## Developer
+## Author
 
-Developed and maintained by [Bisma](https://github.com/bismawy).
+[Bisma](https://github.com/bismawy)
