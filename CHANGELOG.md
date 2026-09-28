@@ -13,6 +13,7 @@
 - Manifest update: enabled `"type": "module"`, updated `"files"` to include `extensions`, `CHANGELOG.md`, `LICENSE`, and `README.md`.
 - Updated package card preview image in `package.json` to `assets/banner.webp`.
 - Restructured `README.md` to mirror `pi-arnative` gold standard: minimal shieldcn outline badges, full-width responsive banner image (`width="100%"`), structured feature overview, clean command tables, and collapsible architecture accordions.
+- Updated tagline to concrete outcome: `Automated model compat flags. In-process self-healing. Zero session restart.`
 
 ---
 

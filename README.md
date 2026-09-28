@@ -1,6 +1,6 @@
 # Auto Compat
 
-Automated model compat flags. In-process healing. Built for Pi.
+Automated model compat flags. In-process self-healing. Zero session restart.
 
 [![Custom badge](https://shieldcn.dev/badge/pi-%20Packages.svg?variant=outline&size=xs&logo=ri%3APiPiBold)](https://pi.dev/packages/@bismawy/pi-auto-compat)
 [![badge](https://shieldcn.dev/npm/@bismawy/pi-auto-compat.svg?variant=outline&size=xs)](https://www.npmjs.com/package/@bismawy/pi-auto-compat)
