@@ -10,14 +10,14 @@ In-process model compatibility flags self-healer. Built for Pi.
 
 ## Overview
 
-Missing `compat` flags cause prompt caching to fail silently, adaptive reasoning to stall, or proxy sessions to break. pi-auto-compat inspects active models and patches `models.json` automatically in-process — no manual editing, no restart loops, and no compatibility warnings.
+pi-auto-compat inspects active models and patches missing compatibility flags in `models.json` in-process.
 
-- **Auto-Heals On The Fly:** Intercepts `session_start` and `model_select`, and watches `models.json` for live changes.
-- **In-Process Refresh:** Invokes `modelRegistry.refresh()` immediately upon write, hot-reloading configurations without restarting Pi.
-- **Cache-Optimizer Parity:** Full alignment with `pi-cache-optimizer` rules for 1-hour cache retention, adaptive generation, proxy anthropic cache control, and session affinity.
-- **Reasoning Map Synthesis:** Synthesizes standard `{ low, medium, high, xhigh }` `thinkingLevelMap` entries for unmapped reasoning models.
-- **Windows Lock Resilience:** Patches `pi-cache-optimizer` with retry and fallback atomic rename to prevent Win32/NTFS `EPERM`/`EBUSY` shard write collisions.
-- **Credential-Safe & Backed Up:** Touches only `compat` and `modelOverrides`. Preserves explicit user settings, leaves API keys intact, and rotates up to 3 timestamped backups.
+- Auto-Heal: Patches missing flags on `session_start`, `model_select`, and `models.json` file events.
+- In-Process Refresh: Invokes `modelRegistry.refresh()` immediately upon write without session restart.
+- Cache-Optimizer Parity: Mirrors 1-hour cache retention, adaptive generation, proxy anthropic cache control, and session affinity.
+- Thinking Map Synthesis: Synthesizes standard `{ low, medium, high, xhigh }` `thinkingLevelMap` for unmapped reasoning models.
+- Windows Lock Resilience: Wraps `writeStatsShardV7` in `pi-cache-optimizer` with retry and copy fallback against NTFS `EPERM`/`EBUSY`.
+- Credential-Safe: Touches only `compat` and `modelOverrides`, keeping API keys untouched with rotating backups (max 3).
 
 ## Install
 
