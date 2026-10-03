@@ -2,7 +2,7 @@
   "name": "@bismawy/pi-auto-compat",
   "version": "1.5.0",
   "type": "module",
-  "description": "In-process compat flags self-healer for Pi: automated cache retention, adaptive generation, developer-role opt-out, proxy session affinity, and thinking level maps.",
+  "description": "Automated model compat flags. In-process self-healing. Zero session restart. Patches models.json on session start, model select and file events.",
   "keywords": [
     "pi-package",
     "pi-extension",
