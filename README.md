@@ -48,6 +48,7 @@ pi -e ./extensions/index.ts
 | Category | Conditions | Applied Flags |
 | --- | --- | --- |
 | **Universal Cache Retention** | All models where unset (except built-in llama.cpp) | `supportsLongCacheRetention: true` (Anthropic & official OpenAI), `false` (third-party OpenAI-compatible) |
+| **Developer Role Opt-Out** | Reasoning models on OpenAI-compatible channels except official OpenAI / OpenRouter | `supportsDeveloperRole: false` — sends the instruction prompt as `system` instead of `developer`, fixing routers that 400 on `messages.0.role` |
 | **Adaptive Generation** | `anthropic-messages` + Opus/Sonnet ≥ 4.6, Fable ≥ 5, Kimi K3 | `forceAdaptiveThinking: true`, `allowEmptySignature: true` (Kimi K3) |
 | **DeepSeek Reasoning** | `openai-completions` / `openai-responses` matching DeepSeek | `requiresReasoningContentOnAssistantMessages: true`, `thinkingFormat: "deepseek"`, session affinity |
 | **Claude on Proxies** | Claude models on OpenAI-compatible proxies | `cacheControlFormat: "anthropic"` |

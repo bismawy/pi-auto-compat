@@ -1,8 +1,8 @@
 {
   "name": "@bismawy/pi-auto-compat",
-  "version": "1.4.4",
+  "version": "1.5.0",
   "type": "module",
-  "description": "In-process compat flags self-healer for Pi: automated cache retention, adaptive generation, proxy session affinity, and thinking level maps.",
+  "description": "In-process compat flags self-healer for Pi: automated cache retention, adaptive generation, developer-role opt-out, proxy session affinity, and thinking level maps.",
   "keywords": [
     "pi-package",
     "pi-extension",
