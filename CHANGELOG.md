@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.0] - 2026-10-03
+
+### Added
+- Universal developer-role opt-out: reasoning models on OpenAI-compatible channels other than official OpenAI / OpenRouter get `supportsDeveloperRole: false`, so Pi sends the instruction prompt as role `system`. Fixes third-party routers that accept only `system|user|assistant|tool` and answer `400 messages.0.role: Invalid option` (e.g. Enclave/Cyberouter). Written provider-level, and explicit user values are respected.
+- `test/placement.test.mjs` verifying provider-level placement against a throwaway agent dir.
+
 ## [1.4.4] - 2026-09-28
 
 ### Added

@@ -14,6 +14,12 @@
  *      prompt_cache_retention; pi's implicit default is true, so omission is
  *      not safe). Explicit user values are respected. New models added via
  *      /better-custom are covered automatically — no per-model injection.
+ *   0b. UNIVERSAL: developer-role capability for reasoning models on
+ *      OpenAI-compatible channels other than official OpenAI / OpenRouter
+ *      → supportsDeveloperRole: false, so Pi sends the instruction prompt as
+ *        "system" instead of "developer". Many third-party routers accept only
+ *        system|user|assistant|tool and answer 400
+ *        `messages.0.role: Invalid option` otherwise. Explicit values win.
  *   1. Adaptive generation (api anthropic-messages + Opus/Sonnet >= 4.6,
  *      Fable >= 5, or Kimi Coding K3 channel)
  *      → forceAdaptiveThinking: true (+ allowEmptySignature for K3 empty-sig)
@@ -85,6 +91,7 @@ const ADAPTIVE_RE =
 // Channel-capability compat keys — safe at provider level.
 const PROVIDER_SAFE_KEYS = new Set([
 	"sendSessionAffinityHeaders",
+	"supportsDeveloperRole",
 	"supportsLongCacheRetention",
 ]);
 
@@ -99,6 +106,7 @@ interface RtModel {
 	name?: string;
 	api?: string;
 	baseUrl?: string;
+	reasoning?: unknown;
 	compat?: Compat;
 	[key: string]: unknown;
 }
@@ -192,6 +200,13 @@ function isOfficialOpenAI(m: RtModel): boolean {
 	}
 }
 
+function isOpenRouter(m: RtModel): boolean {
+	return (
+		lower(m.provider) === "openrouter" ||
+		lower(m.baseUrl).includes("openrouter.ai")
+	);
+}
+
 /**
  * Compat suggestion for one merged model — priority chain & semantics
  * identical to pi-cache-optimizer's describeMissingCacheCompatForModel +
@@ -216,6 +231,27 @@ export function suggestCompat(m: RtModel): Compat {
 	if (compat.supportsLongCacheRetention === undefined) {
 		out.supportsLongCacheRetention =
 			lower(api) === "anthropic-messages" || isOfficialOpenAI(m);
+	}
+
+	// 0b. Developer role — channel capability, not a model trait. Pi sends the
+	// instruction prompt as role "developer" for reasoning models unless
+	// supportsDeveloperRole is false (openai-completions) / not true
+	// (openai-responses). Its detectCompat defaults that flag to true for
+	// providers outside its known non-standard list, but many third-party
+	// OpenAI-compatible routers accept only system|user|assistant|tool and
+	// answer 400 `messages.0.role: Invalid option` (e.g. Enclave/Cyberouter).
+	// "system" is accepted by every OpenAI-compatible channel, so declaring
+	// false is the safe default. Official OpenAI keeps the native developer
+	// role; OpenRouter is excluded because Pi deliberately keeps developer for
+	// its anthropic/openai models.
+	if (
+		m.reasoning === true &&
+		isOpenAICompatibleApi(api) &&
+		compat.supportsDeveloperRole === undefined &&
+		!isOfficialOpenAI(m) &&
+		!isOpenRouter(m)
+	) {
+		out.supportsDeveloperRole = false;
 	}
 
 	// 1. Adaptive thinking (only relevant on anthropic-messages).
