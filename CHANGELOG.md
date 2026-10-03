@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- `package.json` `description` now leads with the README tagline ("Automated model compat flags. In-process self-healing. Zero session restart.") followed by the capability summary, per the `/arnative-pi` manifest standard — pi.dev/packages renders this field verbatim as the package card description.
+
 ## [1.5.0] - 2026-10-03
 
 ### Added
