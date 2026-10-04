@@ -68,6 +68,7 @@ import {
 	existsSync,
 	readdirSync,
 	readFileSync,
+	statSync,
 	unlinkSync,
 	watch,
 	writeFileSync,
@@ -620,11 +621,13 @@ function scanTargets(ctx: ExtensionContext | undefined): RtModel[] {
 
 // ── Windows Cache-Optimizer Atomic-Rename Fix ─────────────────────────
 
-const SAFE_RENAME_BLOCK = String.raw`async function safeAtomicRename(tempPath: string, destPath: string, maxRetries = 5): Promise<void> {
+const SAFE_RENAME_BLOCK = String.raw`export async function safeAtomicRename(tempPath: string, destPath: string, maxRetries = 5): Promise<void> {
+  let renamed = false;
   try {
     for (let i = 0; i < maxRetries; i++) {
       try {
         await rename(tempPath, destPath);
+        renamed = true;
         return;
       } catch (err: any) {
         const code = err?.code;
@@ -632,86 +635,118 @@ const SAFE_RENAME_BLOCK = String.raw`async function safeAtomicRename(tempPath: s
           await new Promise((resolve) => setTimeout(resolve, 25 * (i + 1)));
           continue;
         }
-        try {
-          await copyFile(tempPath, destPath);
-          return;
-        } catch {
-          throw err;
-        }
+        // copyFile does not fail on a briefly-held destination, but it
+        // truncates in place, so a crash mid-copy can leave a partial shard.
+        // Readers skip malformed shards and the next update publishes a
+        // complete replacement, so that beats losing persistence entirely.
+        await copyFile(tempPath, destPath);
+        renamed = true;
+        return;
       }
     }
   } finally {
-    await unlink(tempPath).catch(() => {});
+    if (renamed) await unlink(tempPath).catch(() => {});
   }
 }
 
-async function writeStatsShardV7(path: string, shard: PersistedStatsShardV7): Promise<void> {
+export async function writeStatsShardV7(path: string, shard: PersistedStatsShardV7): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tempPath = path + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
   await writeFile(tempPath, JSON.stringify(shard, null, 2) + "\n", "utf8");
   await safeAtomicRename(tempPath, path);
 }`;
-const SHARD_PATTERN =
-	/async function writeStatsShardV7\([^)]*\)[^{]*\{[\s\S]*?\n\}/;
+// Anchor on the column-zero closing brace so nested blocks inside the function
+// body cannot terminate the match early. `export` must stay outside the match:
+// swallowing it would leave writeStatsShardV7 unexported and break index.ts.
+const WRITER_PATTERN =
+	/(?:export )?async function writeStatsShardV7\([^)]*\)[^{]*\{[\s\S]*?\n\}/;
+
+// The injected helper needs copyFile, which stats-store.ts does not import.
+const NODE_FS_IMPORT_PATTERN = /import \{([^}]*)\} from "node:fs\/promises";/;
+
+const PATCH_REGION =
+	/(?:export )?async function safeAtomicRename\([^)]*\)[^{]*\{[\s\S]*?\n\}\s*\n\s*(?:export )?async function writeStatsShardV7\([^)]*\)[^{]*\{[\s\S]*?\n\}/;
 
 // A previously generated patch could corrupt the `+"\n"` escape into a real
 // newline, producing a file that no longer parses. Detect it so we overwrite
 // the whole safeAtomicRename region instead of trusting the marker alone.
 const BROKEN_ESCAPE = /\+\s*"\s*\r?\n/;
 
+// `writeStatsShardV7` moved out of index.ts into src/stats-store.ts in
+// pi-cache-optimizer 2.8.18. Patching only index.ts silently no-ops and the
+// EPERM keeps coming back, so try the owning module first.
+const WRITER_MODULE_CANDIDATES = [
+	"npm/node_modules/pi-cache-optimizer/src/stats-store.ts",
+	"npm/node_modules/pi-cache-optimizer/index.ts",
+];
+
+function ensureCopyFileImport(content: string): string {
+	const match = NODE_FS_IMPORT_PATTERN.exec(content);
+	if (!match) return content;
+	const names = match[1].split(",").map((name) => name.trim()).filter(Boolean);
+	if (names.includes("copyFile")) return content;
+	names.push("copyFile");
+	names.sort();
+	return content.replace(NODE_FS_IMPORT_PATTERN, `import { ${names.join(", ")} } from "node:fs/promises";`);
+}
+
+function patchWriterModule(targetPath: string): boolean {
+	if (!existsSync(targetPath)) return false;
+	let content: string;
+	let next: string;
+	try {
+		content = readFileSync(targetPath, "utf8");
+		if (content.includes("safeAtomicRename")) {
+			// Already patched, but an older revision could have corrupted the
+			// `+"\n"` escape. Rebuild both functions from the known-good text.
+			if (!BROKEN_ESCAPE.test(content)) return false;
+			next = content.replace(PATCH_REGION, SAFE_RENAME_BLOCK);
+		} else {
+			// The helper does not exist yet, so insert it together with the
+			// replacement writer. Splitting on the function header keeps the
+			// `export` keyword outside the match.
+			const splitAt = SAFE_RENAME_BLOCK.indexOf("export async function writeStatsShardV7");
+			next = content.replace(WRITER_PATTERN, SAFE_RENAME_BLOCK.slice(0, splitAt) + SAFE_RENAME_BLOCK.slice(splitAt));
+		}
+		next = ensureCopyFileImport(next);
+		if (next === content) return false;
+		writeFileSync(targetPath, next, "utf8");
+		return true;
+	} catch {
+		// Non-fatal if the package is read-only or temporarily unavailable.
+		return false;
+	}
+}
+
 /**
- * On Windows, NTFS/Win32 rename throws EPERM/EBUSY if the destination shard
- * is briefly held open by a reader (e.g. concurrent Pi process or scanner),
- * triggering "Warning: pi-cache-optimizer: failed to persist footer stats".
- * Patch writeStatsShardV7 in pi-cache-optimizer to use safeAtomicRename
- * (retry with backoff + copyFile fallback) and clean up orphaned .tmp shards.
+ * On Windows, NTFS/Win32 rename throws EPERM/EBUSY when the destination shard
+ * is briefly held open by a reader. pi-cache-optimizer re-reads the shard
+ * directory on every stats refresh, including the shard it is renaming, so
+ * the writer needs a retry. Patch the module that owns writeStatsShardV7 and
+ * remove only genuinely orphaned `.tmp` shards.
  */
 export function patchCacheOptimizerWindows(): boolean {
 	if (process.platform !== "win32") return false;
 
-	const targetPath = join(
-		getAgentDir(),
-		"npm/node_modules/pi-cache-optimizer/index.ts",
-	);
-	let patched = false;
-	try {
-		if (existsSync(targetPath)) {
-			const content = readFileSync(targetPath, "utf8");
-			const corrupted = BROKEN_ESCAPE.test(content);
-			const hasSafe = content.includes("safeAtomicRename");
+	const agentDir = getAgentDir();
+	const patched = WRITER_MODULE_CANDIDATES.map((relative) =>
+		patchWriterModule(join(agentDir, relative)),
+	).some(Boolean);
 
-			if (corrupted && hasSafe) {
-				// Overwrite the whole broken region with the known-good block.
-				const region = /async function safeAtomicRename[\s\S]*?async function writeStatsShardV7\([^)]*\)[^{]*\{[\s\S]*?\n\}/;
-				if (region.test(content)) {
-					writeFileSync(targetPath, content.replace(region, SAFE_RENAME_BLOCK), "utf8");
-					patched = true;
-				}
-			} else if (!hasSafe && SHARD_PATTERN.test(content)) {
-				writeFileSync(targetPath, content.replace(SHARD_PATTERN, SAFE_RENAME_BLOCK), "utf8");
-				patched = true;
-			}
-		}
-	} catch {
-		// Non-fatal if target is read-only or temporarily unavailable.
-	}
-
-	// Clean up any stale orphaned .tmp files in shards directory
 	try {
-		const shardsDir = join(
-			getAgentDir(),
-			"pi-cache-optimizer-stats.d",
-			"shards",
-		);
+		const shardsDir = join(agentDir, "pi-cache-optimizer-stats.d", "shards");
 		if (existsSync(shardsDir)) {
-			const files = readdirSync(shardsDir);
-			for (const file of files) {
-				if (file.endsWith(".tmp")) {
-					try {
-						unlinkSync(join(shardsDir, file));
-					} catch {
-						// ignore if currently locked
-					}
+			const orphanCutoff = Date.now() - 60 * 60 * 1000;
+			for (const name of readdirSync(shardsDir)) {
+				if (!name.endsWith(".tmp")) continue;
+				const tmpPath = join(shardsDir, name);
+				try {
+					// A live writer's tmp file lives for one rename round-trip, so
+					// anything older than an hour is an orphan, not a race.
+					if (statSync(tmpPath).mtimeMs > orphanCutoff) continue;
+					unlinkSync(tmpPath);
+				} catch {
+					// ignore if currently locked
 				}
 			}
 		}

@@ -6,6 +6,13 @@
 - Universal developer-role opt-out: reasoning models on OpenAI-compatible channels other than official OpenAI / OpenRouter get `supportsDeveloperRole: false`, so Pi sends the instruction prompt as role `system`. Fixes third-party routers that accept only `system|user|assistant|tool` and answer `400 messages.0.role: Invalid option` (e.g. Enclave/Cyberouter). Written provider-level, and explicit user values are respected.
 - `test/placement.test.mjs` verifying provider-level placement against a throwaway agent dir.
 
+### Fixed
+- Windows cache-optimizer patch silently no-oped on `pi-cache-optimizer` 2.8.18+, which moved `writeStatsShardV7` from `index.ts` into `src/stats-store.ts`. The patcher now targets the owning module first and falls back to `index.ts`, and injects the `copyFile` import the helper needs.
+- `safeAtomicRename` no longer deletes the temp shard when the rename never succeeded: a `renamed` flag skips the `unlink`, so a failed publish keeps the shard data instead of losing it.
+- Orphaned `.tmp` cleanup now only removes shards older than one hour, so a temp file belonging to a live writer is no longer unlinked mid-rename (a self-inflicted `EPERM` source).
+- `safeAtomicRename` and `writeStatsShardV7` are exported so the patch can be unit-tested against a fixture module.
+- Added `test/cache-optimizer-windows-patch.test.mjs` covering patch application, import injection, and idempotency.
+
 ## [1.4.4] - 2026-09-28
 
 ### Added
