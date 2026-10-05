@@ -1,8 +1,8 @@
 {
   "name": "@bismawy/pi-auto-compat",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "type": "module",
-  "description": "Automated model compat flags. In-process self-healing. Zero session restart. Patches models.json on session start, model select and file events.",
+  "description": "Automated model compat flags & context/metadata sync. In-process self-healing. Zero session restart. Patches models.json on session start, model select and file events.",
   "keywords": [
     "pi-package",
     "pi-extension",
