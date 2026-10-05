@@ -1,6 +1,15 @@
 # Changelog
 
-## [Unreleased]
+## [1.5.1] - 2026-10-05
+
+### Added
+- **Model-metadata sync**: pi-auto-compat now probes each custom channel's `GET /models` endpoint and writes the real `contextWindow` / `maxTokens` into `models.json`, so a 1M-token model no longer runs on Pi's 128k default. Works for any OpenAI-compatible channel (DeepSeek, GLM, Kimi, Qwen, MiMo, Claude/Gemini proxies, …).
+  - Parses the widest context field (`context_length`, `context_window`, `max_model_len`, `max_input_tokens`, …) and the output cap (`max_output_tokens`, `max_completion_tokens`, `max_tokens`, …). A generic `max_tokens` equal to the window is the context length, not an output cap, and is ignored.
+  - **Smart and conservative**: unit anomalies are rejected (a per-request number an order of magnitude below the current window is not written); values only ever grow; a generic `max_tokens` above the context is clamped to the window.
+  - **Verification round-trip**: every network value is stamped with provenance in a sidecar (`pi-auto-compat-sync.json`). A hand-edited value is detected as a manual override and never overwritten twice; a real API correction is still applied.
+  - **Non-blocking**: runs on `session_start` and `model_select`, TTL-gated to 6 hours and keyed by a `baseUrl` + model-id signature, so switching models does not re-hit the network. `/auto-compat` forces a full re-probe.
+  - Reads per-channel credentials from `models.json` (`$ENV`, `!command`, literal); a channel whose key cannot be resolved is reported as unreachable, never silently mis-detected. `models[].contextWindow` is updated in place and `modelOverrides` is used for extension-owned providers.
+- `test/context-sync.test.mjs` covering the parser, the anomaly guard, provenance (manual override protected), and TTL behavior against a local HTTP server.
 
 ### Changed
 - `package.json` `description` now leads with the README tagline ("Automated model compat flags. In-process self-healing. Zero session restart.") followed by the capability summary, per the `/arnative-pi` manifest standard — pi.dev/packages renders this field verbatim as the package card description.

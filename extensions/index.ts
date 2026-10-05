@@ -33,6 +33,14 @@
  *        false is a valid opt-out (proxies/CDNs blocking affinity headers
  *        with 403) and is never overwritten.
  *   5. Static: reasoning model without thinkingLevelMap → default map.
+ *   6. MODEL-METADATA SYNC: custom channels expose their real limits over
+ *      GET /models. Read the widest context window (context_length,
+ *      max_model_len, max_input_tokens, …) and the output cap
+ *      (max_output_tokens, …) and write them into models.json, so a 1M-token
+ *      model no longer runs on Pi's 128k default. Network values are stamped
+ *      with provenance (sidecar), so a hand-edited value is never overwritten
+ *      twice; values only ever grow (except a real API correction), and unit
+ *      anomalies (a per-request number next to a huge window) are ignored.
  *
  * Source of truth = MERGED models from ctx.modelRegistry (catalog +
  * provider.compat + models[].compat + modelOverrides). Providers without a
@@ -63,6 +71,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { execSync } from "node:child_process";
 import {
 	copyFileSync,
 	existsSync,
@@ -537,6 +546,374 @@ export function fixModelsConfig(
 	return { changed: true, detail };
 }
 
+// ── Provider model-metadata sync (contextWindow / maxTokens) ─────────
+
+// models.json is the source of truth for custom channels; most expose their
+// real limits over GET /models. Every network value is written with a
+// provenance stamp so a hand-edited value is never overwritten twice.
+const SYNC_STATE_FILE = join(getAgentDir(), "pi-auto-compat-sync.json");
+const SYNC_SCHEMA = 1;
+const SYNC_TTL_MS = 6 * 60 * 60 * 1000;
+const SYNC_TIMEOUT_MS = 8000;
+const SYNC_MAX_BYTES = 2 * 1024 * 1024;
+
+// Widest context window first. max_model_len / max_input_tokens are the
+// upstream limits, not the served window, and some fields only exist for the
+// input side.
+const CONTEXT_KEYS = [
+	"context_length",
+	"context_window",
+	"max_context_length",
+	"max_model_len",
+	"max_context_window",
+	"max_input_tokens",
+	"max_input_length",
+	"context_size",
+];
+// Exact output fields first, then generic names. A generic max_tokens is used
+// only when it does not exceed the context window.
+const OUTPUT_KEYS = [
+	"max_output_tokens",
+	"max_completion_tokens",
+	"max_output_length",
+	"max_tokens",
+];
+
+interface ContextFields {
+	contextWindow?: number;
+	maxTokens?: number;
+}
+
+function positiveInt(value: unknown): number | undefined {
+	const n = typeof value === "string" && value.trim() ? Number(value.trim()) : value;
+	return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** Parse numeric context/output limits from one catalog entry. */
+export function parseContextFields(entry: unknown): ContextFields {
+	const rec = (entry ?? {}) as Record<string, unknown>;
+	const out: ContextFields = {};
+	for (const key of CONTEXT_KEYS) {
+		const value = positiveInt(rec[key]);
+		if (value !== undefined) {
+			out.contextWindow = value;
+			break;
+		}
+	}
+	for (const key of OUTPUT_KEYS) {
+		const value = positiveInt(rec[key]);
+		if (value === undefined) continue;
+		// A generic max_tokens above the window is the context length, not an
+		// output cap (`max_model_len: 262144` next to `max_tokens: 262144`).
+		if (out.contextWindow !== undefined && value >= out.contextWindow) continue;
+		out.maxTokens = value;
+		break;
+	}
+	return out;
+}
+
+/**
+ * Keep a real API correction but reject unit anomalies: a candidate an order
+ * of magnitude below the existing window is a per-request/per-call number, not
+ * the served window. Everything else wins, including growth and small shrinks.
+ */
+function contextWindowAccepted(candidate: number, existing: number | undefined): boolean {
+	if (existing === undefined || candidate === existing) return true;
+	if (candidate > existing) return true;
+	return candidate * 5 >= existing;
+}
+
+interface SyncSource {
+	contextWindow?: number;
+	maxTokens?: number;
+	at: number;
+}
+interface SyncState {
+	schema: number;
+	providers: Record<string, { signature: string; fetchedAt: number }>;
+	sources: Record<string, SyncSource>;
+}
+
+function loadSyncState(): SyncState {
+	try {
+		const parsed = JSON.parse(readFileSync(SYNC_STATE_FILE, "utf8")) as Partial<SyncState>;
+		if (parsed && parsed.schema === SYNC_SCHEMA) {
+			return {
+				schema: SYNC_SCHEMA,
+				providers: parsed.providers ?? {},
+				sources: parsed.sources ?? {},
+			};
+		}
+	} catch {
+		// first run / unreadable — rebuild from scratch
+	}
+	return { schema: SYNC_SCHEMA, providers: {}, sources: {} };
+}
+
+function saveSyncState(state: SyncState): void {
+	try {
+		writeFileSync(SYNC_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+	} catch {
+		// best-effort: a failed write only costs a re-fetch next run
+	}
+}
+
+/** Resolve a models.json apiKey value: "$VAR" env, "!cmd" shell, else literal. */
+function resolveSecret(value: unknown): string | undefined {
+	if (typeof value !== "string" || !value) return undefined;
+	if (value.startsWith("$")) return process.env[value.slice(1)]?.trim() || undefined;
+	if (value.startsWith("!")) {
+		try {
+			return (
+				execSync(value.slice(1), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() ||
+				undefined
+			);
+		} catch {
+			return undefined;
+		}
+	}
+	return value;
+}
+
+function stringHeaders(value: unknown): Record<string, string> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const out: Record<string, string> = {};
+	for (const [key, val] of Object.entries(value)) {
+		if (typeof val === "string") out[key] = val;
+	}
+	return out;
+}
+
+async function fetchContextMap(
+	baseUrl: string,
+	apiKey: unknown,
+	headers: unknown,
+): Promise<Map<string, ContextFields>> {
+	const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+	const requestHeaders: Record<string, string> = {
+		accept: "application/json",
+		"accept-encoding": "identity",
+		...stringHeaders(headers),
+	};
+	const key = resolveSecret(apiKey);
+	if (key) requestHeaders.authorization = `Bearer ${key}`;
+
+	const response = await fetch(url, {
+		headers: requestHeaders,
+		signal: AbortSignal.timeout(SYNC_TIMEOUT_MS),
+	});
+	if (!response.ok) throw new Error(`HTTP ${response.status}`);
+	const text = await response.text();
+	if (text.length > SYNC_MAX_BYTES) throw new Error("response too large");
+
+	const json = JSON.parse(text) as unknown;
+	const list = Array.isArray(json)
+		? json
+		: Array.isArray((json as { data?: unknown })?.data)
+			? (json as { data: unknown[] }).data
+			: [];
+	const map = new Map<string, ContextFields>();
+	for (const item of list) {
+		const id = (item as { id?: unknown })?.id;
+		if (typeof id !== "string" || !id) continue;
+		const fields = parseContextFields(item);
+		if (fields.contextWindow !== undefined || fields.maxTokens !== undefined) map.set(id, fields);
+	}
+	return map;
+}
+
+// Every models.json read-modify-write (the compat fixer and the context sync)
+// runs synchronously start-to-finish with no await inside, so the single-
+// threaded event loop cannot interleave two writers.
+
+interface SyncTarget {
+	provider: string;
+	baseUrl: string;
+	apiKey: unknown;
+	headers: unknown;
+	signature: string;
+}
+
+/** Providers in models.json that expose a baseUrl, keyed by model ids. */
+function contextSyncTargets(
+	ctx: ExtensionContext | undefined,
+	cfg: ModelsConfig,
+): SyncTarget[] {
+	const byProvider = groupByProvider(registryModels(ctx));
+	const out: SyncTarget[] = [];
+	for (const [provider, raw] of Object.entries(cfg.providers ?? {})) {
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+		const entry = raw as unknown as ProviderEntry;
+		const list = byProvider.get(lower(provider)) ?? [];
+		const baseUrl =
+			typeof entry.baseUrl === "string" && entry.baseUrl
+				? entry.baseUrl
+				: list.find((m) => typeof m.baseUrl === "string" && m.baseUrl)?.baseUrl;
+		if (!baseUrl) continue;
+		const modelIds = Array.isArray(entry.models)
+			? entry.models
+					.map((m) => String((m as ModelEntry)?.id ?? ""))
+					.filter(Boolean)
+			: [];
+		const ids = [...new Set([...modelIds, ...list.map((m) => m.id)])].sort();
+		out.push({
+			provider,
+			baseUrl,
+			apiKey: (entry as { apiKey?: unknown }).apiKey,
+			headers: entry.headers,
+			signature: JSON.stringify({ schema: SYNC_SCHEMA, baseUrl, ids }),
+		});
+	}
+	return out;
+}
+
+interface SyncResult {
+	changed: boolean;
+	detail: string[];
+	errors: string[];
+}
+
+/** Read+write models.json with fetched metadata; no awaits, so it cannot
+ * interleave with the compat fixer's read-modify-write. */
+function applyContextSync(
+	ctx: ExtensionContext | undefined,
+	metas: Map<string, { map: Map<string, ContextFields>; signature: string }>,
+	state: SyncState,
+): { changed: boolean; detail: string[] } {
+	const cfg = loadModelsConfig();
+	if (!cfg) return { changed: false, detail: [] };
+	const registry = registryOf(ctx);
+	const byProvider = groupByProvider(registryModels(ctx));
+	const detail: string[] = [];
+
+	for (const [provider, { map, signature }] of metas) {
+		const providers = (cfg.providers ??= {}) as Record<string, ProviderEntry>;
+		const entry = (providers[provider] ??= {});
+		const overrideOnly = extensionOwnsModels(registry, provider);
+		const modelsArr = Array.isArray(entry.models) ? (entry.models as unknown[]) : undefined;
+
+		for (const model of byProvider.get(lower(provider)) ?? []) {
+			const fields = map.get(model.id);
+			if (!fields) continue;
+			const modelEntry = modelsArr?.find(
+				(me): me is ModelEntry =>
+					!!me && typeof me === "object" && !Array.isArray(me) && String((me as ModelEntry).id) === model.id,
+			);
+
+			const useOverride = overrideOnly || !modelEntry;
+			let target: ModelEntry;
+			let label: string;
+			if (useOverride) {
+				const mo = (entry.modelOverrides ??= {}) as Record<string, ModelEntry>;
+				target = (mo[model.id] ??= {});
+				label = `providers["${provider}"].modelOverrides["${model.id}"]`;
+			} else {
+				target = modelEntry;
+				label = `providers["${provider}"].models["${model.id}"]`;
+			}
+
+			const key = `${lower(provider)}\0${model.id}`;
+			const prev = state.sources[key];
+			const existingCtx = typeof target.contextWindow === "number" ? target.contextWindow : undefined;
+			const existingMax = typeof target.maxTokens === "number" ? target.maxTokens : undefined;
+			// A previous network value that the user has since changed is now a
+			// manual override — never touch that field again.
+			const manualCtx = prev?.contextWindow !== undefined && existingCtx !== prev.contextWindow;
+			const manualMax = prev?.maxTokens !== undefined && existingMax !== prev.maxTokens;
+			const nextSource: SyncSource = { at: Date.now() };
+
+			if (fields.contextWindow !== undefined && !manualCtx) {
+				if (existingCtx === fields.contextWindow) {
+					nextSource.contextWindow = fields.contextWindow;
+				} else if (contextWindowAccepted(fields.contextWindow, existingCtx)) {
+					target.contextWindow = fields.contextWindow;
+					nextSource.contextWindow = fields.contextWindow;
+					detail.push(`${label}.contextWindow ${existingCtx ?? "unset"} → ${fields.contextWindow}`);
+				} else {
+					nextSource.contextWindow = prev?.contextWindow;
+				}
+			} else {
+				nextSource.contextWindow = prev?.contextWindow;
+			}
+
+			const effectiveCtx = fields.contextWindow ?? existingCtx;
+			if (fields.maxTokens !== undefined && !manualMax) {
+				const candidate =
+					effectiveCtx !== undefined && fields.maxTokens > effectiveCtx
+						? effectiveCtx
+						: fields.maxTokens;
+				if (existingMax === undefined || candidate > existingMax) {
+					target.maxTokens = candidate;
+					nextSource.maxTokens = candidate;
+					detail.push(`${label}.maxTokens ${existingMax ?? "unset"} → ${candidate}`);
+				} else {
+					nextSource.maxTokens = prev?.maxTokens;
+				}
+			} else {
+				nextSource.maxTokens = prev?.maxTokens;
+			}
+
+			if (nextSource.contextWindow !== undefined || nextSource.maxTokens !== undefined)
+				state.sources[key] = nextSource;
+		}
+
+		state.providers[provider] = { signature, fetchedAt: Date.now() };
+	}
+
+	if (detail.length === 0) return { changed: false, detail };
+	const err = writeModelsConfig(cfg);
+	if (err) return { changed: false, detail: [`WRITE FAILED: ${err}`] };
+	return { changed: true, detail };
+}
+
+let syncInFlight = false;
+
+/**
+ * Probe every models.json channel's /models endpoint and sync
+ * contextWindow/maxTokens. Non-forced runs skip providers fetched within the
+ * TTL and whose signature (baseUrl + model ids) is unchanged.
+ */
+export async function runContextSync(
+	ctx: ExtensionContext | undefined,
+	force: boolean,
+): Promise<SyncResult> {
+	if (syncInFlight) return { changed: false, detail: [], errors: [] };
+	syncInFlight = true;
+	try {
+		const cfg = loadModelsConfig();
+		if (!cfg) return { changed: false, detail: [], errors: [] };
+		const state = loadSyncState();
+		const now = Date.now();
+
+		const errors: string[] = [];
+		const metas = new Map<string, { map: Map<string, ContextFields>; signature: string }>();
+		for (const target of contextSyncTargets(ctx, cfg)) {
+			const prev = state.providers[target.provider];
+			const fresh =
+				!force &&
+				prev !== undefined &&
+				prev.signature === target.signature &&
+				now - prev.fetchedAt < SYNC_TTL_MS;
+			if (fresh) continue;
+			try {
+				const map = await fetchContextMap(target.baseUrl, target.apiKey, target.headers);
+				metas.set(target.provider, { map, signature: target.signature });
+			} catch (error) {
+				errors.push(`${target.provider}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+
+		if (metas.size === 0) return { changed: false, detail: [], errors };
+
+		const result = applyContextSync(ctx, metas, state);
+		// Persist fetchedAt even without changes so the TTL is honored.
+		saveSyncState(state);
+		return { ...result, errors };
+	} finally {
+		syncInFlight = false;
+	}
+}
+
 // ── Extension ───────────────────────────────────────────────────────
 
 // Sync subset of the ctx.modelRegistry facade this extension uses.
@@ -896,14 +1273,41 @@ function notify(
 		}
 	}
 
+	async function runContextSyncSafe(
+		ctx: ExtensionContext,
+		force: boolean,
+	): Promise<SyncResult> {
+		try {
+			const result = await runContextSync(ctx, force);
+			if (result.changed) {
+				try {
+					await registryOf(ctx)?.refresh?.({ allowNetwork: false });
+				} catch {
+					// apply on next refresh
+				}
+			}
+			return result;
+		} catch {
+			return { changed: false, detail: [], errors: [] };
+		}
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		patchCacheOptimizerWindows();
 		startWatcher(ctx);
+		// Metadata sync is network-bound; run it off the startup path and only
+		// announce when it actually corrected something.
+		void runContextSyncSafe(ctx, false).then((result) => {
+			if (result.changed)
+				notify(ctx, `context/maxTokens synced (${result.detail.length} change(s)).`, "success");
+		});
 	});
 
 	pi.on("model_select", (event, ctx) => {
 		const model = (event as { model?: RtModel } | undefined)?.model;
 		if (model) runFixSafe(ctx, [model]);
+		// TTL-gated: hits the network only when a channel's signature is stale.
+		void runContextSyncSafe(ctx, false);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -912,7 +1316,7 @@ function notify(
 
 	pi.registerCommand("auto-compat", {
 		description:
-			"Check & fix compat/thinkingLevelMap in models.json (detection mirrors pi-cache-optimizer), then refresh the registry",
+			"Fix compat/thinkingLevelMap and sync contextWindow/maxTokens from each channel's /models endpoint",
 		handler: async (_args, ctx) => {
 			const targets = scanTargets(ctx);
 			// Force re-run even if already applied this session.
@@ -926,11 +1330,17 @@ function notify(
 			if (patched) {
 				detail.push("pi-cache-optimizer Windows file-lock patch applied");
 			}
-			if (changed || patched) {
+			// Forced: re-probe every channel regardless of TTL.
+			const sync = await runContextSyncSafe(ctx, true);
+			detail.push(...sync.detail.map((line) => `context sync: ${line}`));
+			if (changed || patched || sync.changed) {
 				notify(ctx, `fixed:\n  - ${detail.join("\n  - ")}`, "success");
 				return;
 			}
-			notify(ctx, "nothing to fix.", "info");
+			const unreachable = sync.errors.length
+				? ` (${sync.errors.length} endpoint(s) unreachable: ${sync.errors.join("; ")})`
+				: "";
+			notify(ctx, `nothing to fix${unreachable}.`, sync.errors.length ? "warning" : "info");
 		},
 	});
 }
