@@ -13,11 +13,12 @@ Automated model compat flags. In-process self-healing. Zero session restart.
 pi-auto-compat inspects active models and patches missing compatibility flags in `models.json` in-process.
 
 - Auto-Heal: Patches missing flags on `session_start`, `model_select`, and `models.json` file events.
+- Metadata Sync: Probes each custom channel's `GET /models` and syncs the real `contextWindow` / `maxTokens` (a 1M-token model no longer runs on Pi's 128k default). Smart, conservative and provenance-stamped.
 - In-Process Refresh: Invokes `modelRegistry.refresh()` immediately upon write without session restart.
 - Cache-Optimizer Parity: Mirrors 1-hour cache retention, adaptive generation, proxy anthropic cache control, and session affinity.
 - Thinking Map Synthesis: Synthesizes standard `{ low, medium, high, xhigh }` `thinkingLevelMap` for unmapped reasoning models.
 - Windows Lock Resilience: Wraps `writeStatsShardV7` in `pi-cache-optimizer` with retry and copy fallback against NTFS `EPERM`/`EBUSY`.
-- Credential-Safe: Touches only `compat` and `modelOverrides`, keeping API keys untouched with rotating backups (max 3).
+- Credential-Safe: Touches only `compat`, `modelOverrides`, and the `contextWindow` / `maxTokens` model limits. API keys and base URLs are never modified.
 
 ## Install
 
@@ -34,7 +35,7 @@ pi -e ./extensions/index.ts
 
 | Command | Scope | Action |
 | --- | --- | --- |
-| `/auto-compat` | Global | Audit active models, patch missing flags in `models.json`, and refresh the registry |
+| `/auto-compat` | Global | Audit active models, patch missing flags in `models.json`, force a full metadata re-probe, and refresh the registry |
 
 > **Notes:**
 > - **Zero-Config Background Run:** Fixes are applied automatically on session launch and when switching models.
@@ -54,6 +55,18 @@ pi -e ./extensions/index.ts
 | **Claude on Proxies** | Claude models on OpenAI-compatible proxies | `cacheControlFormat: "anthropic"` |
 | **OpenAI-Compatible Proxies** | Custom `openai-completions` endpoints | `sendSessionAffinityHeaders: true` (when undefined) |
 | **Unmapped Reasoning** | Reasoning models without declared thinking maps | Declares standard `{ low, medium, high, xhigh }` `thinkingLevelMap` |
+| **Metadata Sync** | Custom channels with a `baseUrl` exposing `GET /models` | `contextWindow` from the widest context field; `maxTokens` from the output cap — network values only, provenance-stamped, anomaly-guarded |
+
+</details>
+
+<details>
+<summary><b>Metadata Sync (contextWindow / maxTokens)</b></summary>
+
+- **Detection**: Reads the first matching context field in priority order (`context_length`, `context_window`, `max_model_len`, `max_input_tokens`, …) and the output cap (`max_output_tokens`, `max_completion_tokens`, `max_tokens`, …). A generic `max_tokens` equal to the window is the context length, not an output cap.
+- **Conservative**: Rejects unit anomalies (a per-request number an order of magnitude below the current window); keeps a real API shrink but ignores noise. Output caps above the window are clamped to it.
+- **Provenance**: Each network value is stamped in `pi-auto-compat-sync.json`. A hand-edited value is detected as a manual override and never overwritten twice; a real API correction still applies. Flips both values at once (a manual lower output cap does not freeze the window).
+- **TTL & Signature**: Non-forced runs re-probe a channel only when its `baseUrl` + model-id signature changed or the 6-hour TTL expired; `/auto-compat` forces a full re-probe.
+- **Credentials**: Resolved from `models.json` (`$ENV`, `!command`, or literal) without logging. Unreachable channels are reported, never silently mis-detected.
 
 </details>
 
@@ -76,8 +89,8 @@ pi -e ./extensions/index.ts
 <details>
 <summary><b>Safety & Backups</b></summary>
 
-- Credential-Safe: Only modifies `compat` and `modelOverrides`. Never reads, writes, or logs API keys or base URLs.
-- Rotating Backups: Retains up to 3 timestamped backups (`models.json.backup.*`) before saving.
+- Credential-Safe: Only writes `compat`, `modelOverrides`, and `contextWindow` / `maxTokens`. The metadata probe reads `baseUrl` and `apiKey` from `models.json` to authenticate; neither is ever written back or logged.
+- Rotating Backups: Retains up to 3 timestamped backups (`models.json.bak-auto-compat-*`) before saving.
 
 </details>
 
