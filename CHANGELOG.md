@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.6.0] - 2026-10-14
+
+### Added
+- **Thinking-effort capability probe**: Pi sends `thinkingLevelMap[level] ?? level` as the request's `reasoning_effort`, so a level an upstream does not accept reaches the provider and comes back as HTTP 400 — which routers surface as `502 provider_error` (Enclave → Together rejects `medium` for `deepseek-v4.1-flash`; `qwen3.8-max` rejects `none`/`minimal`/`high`/`max`). Nothing in `GET /models` advertises the accepted subset, so the extension now discovers it with one tiny completion per level (`max_tokens: 16`, the same `thinking`/`reasoning` payload Pi would send, 7 requests per model) and writes rejected levels into `thinkingLevelMap` mapped to the nearest accepted value in Pi's own clamp order (up first, ties down). `/thinking` stays complete and every request succeeds; the effective value is reported once per write (`minimal→low, medium→high`).
+  - **Never guesses**: a level is only marked accepted when the endpoint answered success; an inconclusive network/timeout/5xx interrupt leaves it unwritten, and a status that is not a parameter rejection (401/403) is never retried. A 400 gets one confirmation retry so a single upstream flake cannot rewrite the map.
+  - **Provenance & TTL**: outcomes are stored in `pi-auto-compat-sync.json` with the effective map. Untouched models are re-probed after 24 hours, and immediately when the model's map no longer matches the recorded one (a user edit wins); a channel that answered nothing is retried after 1 hour. A map the user deliberately shaped (a remap, or an explicit `null`) is skipped entirely and not even probed.
+  - **Placement**: an existing `models[]` entry is patched in place; a model without one gets a `modelOverrides` entry (the only layer that reaches extension-owned model lists). Only `thinkingLevelMap` is written — credentials and every other field are left alone.
+  - **Triggers**: `session_start`, `model_select`, and the `models.json` watcher (so `/better-custom` and `/login` additions are covered before the level is picked), plus a reactive pass on `message_end` when an inference error carries a parameter-rejection hint. `/auto-compat` forces a full re-probe for every reasoning model on an OpenAI-compatible channel (a manually shaped map stays exempt).
+  - Scope: `reasoning` models on `openai-completions` / `openai-responses` channels that are not first-party (official OpenAI, OpenRouter, built-in llama.cpp) and are expected to send `reasoning_effort` (`supportsReasoningEffort: false` and the `openrouter` / `chat-template` / `qwen-chat-template` / `ant-ling` formats are excluded).
+- `test/thinking-effort.test.mjs` covering the pure remap, the opt-in-level rules, the deliberate-map guard, the transient-failure guard, the failure TTL, the reactive `message_end` path, and an end-to-end run against a local HTTP server that rejects a subset with 400.
+
+### Changed
+- The `/auto-compat` command description and output now include the thinking-effort probe alongside the compat fixer and the context/maxTokens sync.
+
 ## [1.5.1] - 2026-10-05
 
 ### Added
