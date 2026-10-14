@@ -41,6 +41,19 @@
  *      with provenance (sidecar), so a hand-edited value is never overwritten
  *      twice; values only ever grow (except a real API correction), and unit
  *      anomalies (a per-request number next to a huge window) are ignored.
+ *   7. THINKING-EFFORT CAPABILITY: a channel may accept only a subset of the
+ *      effort names, and nothing in GET /models advertises which. Pi sends
+ *      `thinkingLevelMap[level] ?? level`, so an unsupported level reaches the
+ *      upstream and comes back as 400 (surfaced by routers as 502
+ *      provider_error — e.g. Enclave → Together rejects `medium` for
+ *      deepseek-v4.1-flash). One tiny completion per level (7 per model)
+ *      discovers the accepted subset; rejected levels are remapped to the
+ *      nearest accepted value in Pi's own clamp order (up first), so /thinking
+ *      stays complete and every request succeeds. Provenance-stamped with its
+ *      own TTL, and a map that carries a deliberate remap is never rewritten.
+ *      Triggered when a model appears (startup, model_select, models.json
+ *      watcher) and again after an inference error that looks like a parameter
+ *      rejection.
  *
  * Source of truth = MERGED models from ctx.modelRegistry (catalog +
  * provider.compat + models[].compat + modelOverrides). Providers without a
@@ -215,6 +228,33 @@ function isOpenRouter(m: RtModel): boolean {
 		lower(m.provider) === "openrouter" ||
 		lower(m.baseUrl).includes("openrouter.ai")
 	);
+}
+
+/**
+ * Models whose thinking effort is worth probing: a reasoning model on an
+ * OpenAI-compatible channel that is not a first-party API (which publishes
+ * its own level support) and, unless a pattern proves otherwise, is expected
+ * to accept `reasoning_effort`. A model that sends no effort cannot be fixed
+ * by a map, so it is not probed.
+ */
+function isEffortProbeable(m: EffortModel, channelCompat: Compat): boolean {
+	if (m.reasoning !== true) return false;
+	const api = lower(m.api);
+	if (api !== "openai-completions" && api !== "openai-responses") return false;
+	const asModel = m as unknown as RtModel;
+	if (isOfficialOpenAI(asModel) || isOpenRouter(asModel) || isPiBuiltInLlamaCpp(asModel))
+		return false;
+	const compat = { ...channelCompat, ...(m.compat ?? {}) };
+	if (compat.supportsReasoningEffort === false) return false;
+	switch (compat.thinkingFormat) {
+		case "openrouter":
+		case "chat-template":
+		case "qwen-chat-template":
+		case "ant-ling":
+			return false;
+		default:
+			return true;
+	}
 }
 
 /**
@@ -628,10 +668,18 @@ interface SyncSource {
 	maxTokens?: number;
 	at: number;
 }
+interface EffortSource {
+	at: number;
+	/** The effective map after this run; a user edit makes it stale. */
+	map: EffortMap;
+	/** No level answered last time — retried on the shorter failure TTL. */
+	failed?: boolean;
+}
 interface SyncState {
 	schema: number;
 	providers: Record<string, { signature: string; fetchedAt: number }>;
 	sources: Record<string, SyncSource>;
+	efforts: Record<string, EffortSource>;
 }
 
 function loadSyncState(): SyncState {
@@ -642,12 +690,13 @@ function loadSyncState(): SyncState {
 				schema: SYNC_SCHEMA,
 				providers: parsed.providers ?? {},
 				sources: parsed.sources ?? {},
+				efforts: parsed.efforts ?? {},
 			};
 		}
 	} catch {
 		// first run / unreadable — rebuild from scratch
 	}
-	return { schema: SYNC_SCHEMA, providers: {}, sources: {} };
+	return { schema: SYNC_SCHEMA, providers: {}, sources: {}, efforts: {} };
 }
 
 function saveSyncState(state: SyncState): void {
@@ -911,6 +960,442 @@ export async function runContextSync(
 		return { ...result, errors };
 	} finally {
 		syncInFlight = false;
+	}
+}
+
+// ── Thinking-effort capability probe ─────────────────────────────────
+
+// Pi's thinking levels in clamp order (EXTENDED_THINKING_LEVELS). `off` has no
+// wire name of its own; absent evidence it maps to "none".
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+// Wire levels in Pi's clamp order; `off` sends "none" instead. Anything
+// outside this list has no rank and cannot be remapped.
+const EFFORT_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+// Levels the probe puts on the wire. xhigh/max are opt-in in Pi (a fourth
+// field of support, an explicit mapping), so they are read, never invented.
+const EFFORT_PROBE_LEVELS: readonly string[] = EFFORT_RANK;
+const EFFORT_TTL_MS = 24 * 60 * 60 * 1000;
+// A channel that answered nothing (auth, outage, every level inconclusive) is
+// retried sooner than a probed map, but not on every model_select.
+const EFFORT_FAILURE_TTL_MS = 60 * 60 * 1000;
+const EFFORT_TIMEOUT_MS = 30_000;
+const EFFORT_PROBE_TOKENS = 16;
+// An entire probe attempt (levels × retries). A provider that never answers
+// costs one budget, not one per level.
+const EFFORT_BUDGET_MS = 2 * 60 * 1000;
+// Pi's own thinkingLevelMap synthesis; identity values that carry no
+// information, so the probe may rewrite them (see README placement notes).
+const IDENTITY_EFFORT: EffortMap = { low: "low", medium: "medium", high: "high", xhigh: "xhigh" };
+const EFFORT_RETRY_PAUSE_MS = 1000;
+// Only these errors indict a request parameter. Transient transport failures
+// say nothing about the level, and a credential failure would mark every
+// level accepted without a single real answer.
+const EFFORT_ERROR_RE = /provider.?error|invalid.?request|http 400|400[.:]|reasoning.?effort|thinking|unsupported|not supported|invalid (?:value|option|parameter|enum)|bad request/i;
+
+interface EffortModel {
+	provider: string;
+	id: string;
+	api?: string;
+	reasoning?: unknown;
+	compat?: Compat;
+}
+
+type EffortMap = Record<string, string | null>;
+
+interface EffortProbeTarget {
+	baseUrl: string;
+	apiKey: unknown;
+	headers: unknown;
+	compat: Compat;
+	model: string;
+}
+
+/** A status that names a rejected parameter rather than a broken endpoint. */
+function isParamRejection(status: number, body: string): boolean {
+	if (status === 400 || status === 404 || status === 422) return true;
+	// 5xx is a provider_error on routers that surface a parameter rejection as a
+	// failed inference; 4xx without a hint is a direct rejection. Auth/quota
+	// statuses are deliberately absent: retrying or probing cannot fix them.
+	if (status !== 500 && status !== 502 && status !== 503) return false;
+	return EFFORT_ERROR_RE.test(body);
+}
+
+/**
+ * Probe one level. Returns true/false for a decisive answer or undefined for
+ * an inconclusive transient failure, which must never mark a level accepted.
+ * One retry per status: a first 400 may be an upstream flake, a second
+ * confirms it; the retry also bounds the whole level to two attempts. A 429
+ * asks for a pause instead.
+ */
+async function probeEffortLevel(target: EffortProbeTarget, level: string): Promise<boolean | undefined> {
+	const url = `${target.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+	const headers: Record<string, string> = {
+		"content-type": "application/json",
+		accept: "application/json",
+		...stringHeaders(target.headers),
+	};
+	const key = resolveSecret(target.apiKey);
+	if (key) headers.authorization = `Bearer ${key}`;
+
+	const body = JSON.stringify({
+		model: target.model,
+		messages: [{ role: "user", content: "ping" }],
+		max_tokens: EFFORT_PROBE_TOKENS,
+		stream: false,
+		...(thinkingPayload(target.compat, true) ?? {}),
+		reasoning_effort: level,
+	});
+
+	let last: boolean | undefined;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		let status: number;
+		let text: string;
+		try {
+			const response = await fetch(url, {
+				method: "POST",
+				headers,
+				body,
+				signal: AbortSignal.timeout(EFFORT_TIMEOUT_MS),
+			});
+			status = response.status;
+			text = (await response.text()).slice(0, 4000);
+		} catch {
+			return undefined; // network/timeout: inconclusive
+		}
+		if (status < 300) return true;
+		if (isParamRejection(status, text)) {
+			last = false;
+			continue;
+		}
+		if (status === 429) {
+			await sleep(EFFORT_RETRY_PAUSE_MS);
+			continue;
+		}
+		return undefined; // 401/403/5xx without a parameter hint: unknown
+	}
+	return last;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The non-effort half of Pi's openai-completions request, so the probe tests
+ * the level under realistic conditions. Copied from Pi's branch table (see
+ * the bundle's buildRequestBody): without it a channel that needs
+ * `thinking:{type:enabled}` would report that requirement as a level failure.
+ */
+function thinkingPayload(compat: Compat, enabled: boolean): Record<string, unknown> | undefined {
+	switch (compat.thinkingFormat) {
+		case "deepseek":
+			return { thinking: { type: enabled ? "enabled" : "disabled" } };
+		case "zai":
+			return { thinking: enabled ? { type: "enabled", clear_thinking: false } : { type: "disabled" } };
+		case "qwen":
+			return { enable_thinking: enabled };
+		case "together":
+			return { reasoning: { enabled } };
+		case "openrouter":
+			return enabled ? { reasoning: { effort: "medium" } } : undefined;
+		default:
+			return undefined;
+	}
+}
+
+/** The map a previous probe left behind, per model. */
+function effortMapOf(target: EffortModel): EffortMap | undefined {
+	const cfg = loadModelsConfig();
+	const entry = (cfg?.providers?.[target.provider] ?? undefined) as ProviderEntry | undefined;
+	if (!entry) return undefined;
+	const models = Array.isArray(entry.models) ? (entry.models as unknown[]) : [];
+	const modelEntry = models.find(
+		(me): me is ModelEntry =>
+			!!me && typeof me === "object" && !Array.isArray(me) && String((me as ModelEntry).id) === target.id,
+	);
+	const fromModel = modelEntry?.thinkingLevelMap;
+	const overrides = entry.modelOverrides as Record<string, ModelEntry> | undefined;
+	const fromOverride = overrides?.[target.id]?.thinkingLevelMap;
+	return (fromOverride ?? fromModel) as EffortMap | undefined;
+}
+
+/** Nearest accepted effort for a Pi level: up first (Pi's own clamp order), ties down. */
+export function nearestEffort(level: string, accepted: Set<string>): string | undefined {
+	const idx = EFFORT_RANK.indexOf(level);
+	if (idx === -1) return undefined;
+	let best: string | undefined;
+	let bestDistance = Number.POSITIVE_INFINITY;
+	for (const candidate of accepted) {
+		const cIdx = EFFORT_RANK.indexOf(candidate);
+		if (cIdx === -1) continue;
+		const distance = cIdx >= idx ? cIdx - idx : (idx - cIdx) * 1.01;
+		if (distance < bestDistance) {
+			bestDistance = distance;
+			best = candidate;
+		}
+	}
+	return best;
+}
+
+/** A level rejected upstream is remapped; not a capability, not a fix. */
+function carriesDeliberateRemap(map: EffortMap | undefined): boolean {
+	if (!map) return false;
+	for (const [level, value] of Object.entries(map)) {
+		if (value === null) return true;
+		if (value !== level && IDENTITY_EFFORT[level] !== undefined) return true;
+	}
+	return false;
+}
+
+/**
+ * Turn probe results into a thinkingLevelMap. A rejected level maps to the
+ * nearest accepted value (up first, ties down). Levels that work stay
+ * unmapped, so nothing is pinned that does not need pinning. An opt-in level
+ * (`off`/`xhigh`/`max`) is only adjusted when the probe has evidence about
+ * the value it currently sends: a level the model declares and the probe
+ * never tested is left alone.
+ * Existing `null`s are carried over. Returns undefined when every level was
+ * rejected (nothing honest to say) or nothing changed.
+ */
+export function buildEffortMap(
+	current: EffortMap | undefined,
+	supported: string[],
+): EffortMap | undefined {
+	const accepted = new Set(supported);
+	if (accepted.size === 0) return undefined;
+
+	const out: EffortMap = {};
+	let changed = false;
+	for (const level of THINKING_LEVELS) {
+		const existing = current?.[level];
+		const optIn = level === "off" || level === "xhigh" || level === "max";
+		if (optIn) {
+			if (existing === undefined) continue; // not offered → not the probe's call
+			if (existing === null) {
+				out[level] = null;
+				continue;
+			}
+			if (!PROBED_EFFORTS.has(existing)) {
+				out[level] = existing; // no evidence about this value
+				continue;
+			}
+			// `off` has no rank of its own; its wire form is "none" when offered.
+			const probeFrom = level === "off" ? "minimal" : level;
+			const value =
+				accepted.has(existing)
+					? existing
+					: level === "off" && accepted.has("none")
+						? "none"
+						: nearestEffort(probeFrom, accepted);
+			if (!value) {
+				out[level] = null;
+				changed = true;
+				continue;
+			}
+			if (value !== existing) changed = true;
+			out[level] = value;
+			continue;
+		}
+
+		// A level offered under another name is a deliberate mapping.
+		if (existing !== undefined && existing !== level) {
+			out[level] = existing;
+			continue;
+		}
+		if (existing === null) {
+			out[level] = null;
+			continue;
+		}
+		if (accepted.has(level)) continue; // works, and identity needs no mapping
+		out[level] = nearestEffort(level, accepted) ?? null;
+		changed = true;
+	}
+
+	return changed ? out : undefined;
+}
+
+/** Values the probe actually put on the wire; anything else is unevidenced. */
+const PROBED_EFFORTS = new Set(EFFORT_PROBE_LEVELS);
+
+/** Providers in models.json that can answer a completion request. */
+function effortTargets(
+	ctx: ExtensionContext | undefined,
+	cfg: ModelsConfig,
+): Map<string, { baseUrl: string; apiKey: unknown; headers: unknown; compat: Compat }> {
+	const byProvider = groupByProvider(registryModels(ctx));
+	const out = new Map<string, { baseUrl: string; apiKey: unknown; headers: unknown; compat: Compat }>();
+	for (const [provider, raw] of Object.entries(cfg.providers ?? {})) {
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+		const entry = raw as unknown as ProviderEntry;
+		const merged = byProvider.get(lower(provider))?.[0];
+		const api = lower(entry.api ?? merged?.api);
+		if (api !== "openai-completions" && api !== "openai-responses") continue;
+		const baseUrl =
+			typeof entry.baseUrl === "string" && entry.baseUrl
+				? entry.baseUrl
+				: typeof merged?.baseUrl === "string"
+					? merged.baseUrl
+					: undefined;
+		if (!baseUrl) continue;
+		out.set(lower(provider), {
+			baseUrl,
+			apiKey: (entry as { apiKey?: unknown }).apiKey,
+			headers: entry.headers,
+			compat: { ...(entry.compat ?? {}), ...(merged?.compat ?? {}) },
+		});
+	}
+	return out;
+}
+
+/**
+ * Merge probe outcomes into models.json in one read-modify-write. Only
+ * `thinkingLevelMap` entries are touched; credentials and every other field
+ * are left alone, and a map the user deliberately shaped is skipped.
+ */
+function applyEffortResults(
+	results: { target: EffortModel; supported: string[] }[],
+	state: SyncState,
+): { changed: boolean; detail: string[] } {
+	const cfg = loadModelsConfig();
+	if (!cfg) return { changed: false, detail: [] };
+	const detail: string[] = [];
+	const providers = (cfg.providers ??= {}) as Record<string, ProviderEntry>;
+
+	for (const { target, supported } of results) {
+		const entry = (providers[target.provider] ??= {});
+		const models = Array.isArray(entry.models) ? (entry.models as unknown[]) : undefined;
+		const modelEntry = models?.find(
+			(me): me is ModelEntry =>
+				!!me && typeof me === "object" && !Array.isArray(me) && String((me as ModelEntry).id) === target.id,
+		);
+		const key = `${lower(target.provider)}\0${target.id}`;
+		const current = effortMapOf(target);
+		if (carriesDeliberateRemap(current)) continue; // a map the user delivered, not the probe
+		const next = buildEffortMap(current, supported);
+		if (!next) {
+			state.efforts[key] = { at: Date.now(), map: current ?? {} };
+			continue;
+		}
+
+		const label = modelEntry
+			? `providers["${target.provider}"].models["${target.id}"]`
+			: `providers["${target.provider}"].modelOverrides["${target.id}"]`;
+		let target_: ModelEntry;
+		if (modelEntry) {
+			target_ = modelEntry;
+		} else {
+			const mo = (entry.modelOverrides ??= {}) as Record<string, ModelEntry>;
+			target_ = (mo[target.id] ??= {});
+		}
+		target_.thinkingLevelMap = next;
+		state.efforts[key] = { at: Date.now(), map: next };
+
+		const remapped = Object.entries(next)
+			.filter(([level, value]) => value !== null && value !== level)
+			.map(([level, value]) => `${level}→${value}`);
+		const dropped = Object.entries(next)
+			.filter(([, value]) => value === null)
+			.map(([level]) => level);
+		const parts = [...remapped, ...dropped.map((level) => `${level}=unsupported`)];
+		detail.push(`${label}.thinkingLevelMap ${parts.join(", ")}`);
+	}
+
+	if (detail.length === 0) return { changed: false, detail };
+	const err = writeModelsConfig(cfg);
+	if (err) return { changed: false, detail: [`WRITE FAILED: ${err}`] };
+	return { changed: true, detail };
+}
+
+let effortInFlight = 0;
+
+/**
+ * Probe the reasoning models a channel exposes and rewrite their
+ * thinkingLevelMap. Runs untouched models on startup/model_select/watcher
+ * events (TTL-gated) and a single model after an inference error.
+ */
+export async function probeThinkingEffort(
+	ctx: ExtensionContext | undefined,
+	force: boolean,
+	models?: EffortModel[],
+): Promise<SyncResult> {
+	if (effortInFlight > 0) return { changed: false, detail: [], errors: [] };
+	effortInFlight += 1;
+	try {
+		const cfg = loadModelsConfig();
+		if (!cfg) return { changed: false, detail: [], errors: [] };
+		const byProvider = effortTargets(ctx, cfg);
+		if (byProvider.size === 0) return { changed: false, detail: [], errors: [] };
+
+		const state = loadSyncState();
+		const now = Date.now();
+		const deadline = now + EFFORT_BUDGET_MS;
+		const candidates = models ?? registryModels(ctx);
+		const pending = candidates.filter((m) => {
+			if (!m?.provider || !m.id) return false;
+			const channel = byProvider.get(lower(m.provider));
+			if (!channel || !isEffortProbeable(m, channel.compat)) return false;
+			const current = effortMapOf(m);
+			// A map the user shaped deliberately is theirs; probe it never, not
+			// even for /auto-compat (the user can delete the entry to opt back in).
+			if (carriesDeliberateRemap(current)) return false;
+			if (force) return true;
+			const prev = state.efforts[`${lower(m.provider)}\0${m.id}`];
+			if (!prev) return true;
+			if (now - prev.at >= (prev.failed ? EFFORT_FAILURE_TTL_MS : EFFORT_TTL_MS)) return true;
+			// A user edit supersedes the probed map; re-probe to respect it.
+			return JSON.stringify(current ?? {}) !== JSON.stringify(prev.map);
+		});
+		if (pending.length === 0) return { changed: false, detail: [], errors: [] };
+
+		const results: { target: EffortModel; supported: string[] }[] = [];
+		const unanswered: EffortModel[] = [];
+		const errors: string[] = [];
+		for (const target of pending) {
+			if (deadline - Date.now() <= 0) {
+				errors.push(`${target.provider}: probe budget exhausted`);
+				break;
+			}
+			const channel = byProvider.get(lower(target.provider))!;
+			const supported: string[] = [];
+			for (const level of EFFORT_PROBE_LEVELS) {
+				const accepted = await probeEffortLevel(
+					{
+						model: target.id,
+						baseUrl: channel.baseUrl,
+						apiKey: channel.apiKey,
+						headers: channel.headers,
+						compat: { ...channel.compat, ...(target.compat ?? {}) },
+					},
+					level,
+				);
+				if (accepted === true) supported.push(level);
+			}
+			if (supported.length === 0) {
+				errors.push(`${target.provider}/${target.id}: no level answered (not patched)`);
+				unanswered.push(target);
+				continue;
+			}
+			results.push({ target, supported });
+		}
+		// Stamp what answered nothing so the next non-forced run does not re-send
+		// the same requests; a channel that recovers is re-probed after the TTL.
+		for (const target of unanswered) {
+			state.efforts[`${lower(target.provider)}\0${target.id}`] = {
+				at: now,
+				map: effortMapOf(target) ?? {},
+				failed: true,
+			};
+		}
+		if (results.length === 0) {
+			saveSyncState(state);
+			return { changed: false, detail: [], errors };
+		}
+
+		const applied = applyEffortResults(results, state);
+		saveSyncState(state);
+		return { ...applied, errors };
+	} finally {
+		effortInFlight -= 1;
 	}
 }
 
@@ -1292,6 +1777,49 @@ function notify(
 		}
 	}
 
+	async function runEffortProbeSafe(
+		ctx: ExtensionContext,
+		force: boolean,
+		models?: EffortModel[],
+	): Promise<SyncResult> {
+		try {
+			const result = await probeThinkingEffort(ctx, force, models);
+			if (result.changed) {
+				try {
+					await registryOf(ctx)?.refresh?.({ allowNetwork: false });
+				} catch {
+					// apply on next refresh
+				}
+			}
+			return result;
+		} catch {
+			return { changed: false, detail: [], errors: [] };
+		}
+	}
+
+	// A failed inference carrying a parameter-rejection hint means the level Pi
+	// put on the wire is not accepted. Probe that model and let the caller
+	// retry. Transient errors and failures without the hint say nothing about
+	// the level, so they cost no network traffic.
+	function handleInferenceError(
+		event: { message?: { role?: string; provider?: string; model?: string; errorMessage?: string } },
+		ctx: ExtensionContext,
+	): void {
+		const message = event?.message;
+		if (!message || message.role !== "assistant") return;
+		if (!message.provider || !message.model) return;
+		if (!EFFORT_ERROR_RE.test(message.errorMessage ?? "")) return;
+		// Probing needs the merged model (reasoning + api); a model Pi just ran
+		// is in the registry, so a miss only means the registry moved on.
+		const target = registryModels(ctx).find(
+			(m) => lower(m.provider) === lower(message.provider) && m.id === message.model,
+		);
+		if (!target) return;
+		void runEffortProbeSafe(ctx, true, [target]).then((result) => {
+			if (result.changed) notify(ctx, `thinking effort probed: ${result.detail.join("; ")}`, "success");
+		});
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		patchCacheOptimizerWindows();
 		startWatcher(ctx);
@@ -1301,6 +1829,11 @@ function notify(
 			if (result.changed)
 				notify(ctx, `context/maxTokens synced (${result.detail.length} change(s)).`, "success");
 		});
+		// Thinking-effort probe: same channel list, own TTL.
+		void runEffortProbeSafe(ctx, false).then((result) => {
+			if (result.changed)
+				notify(ctx, `thinking levels probed:\n  - ${result.detail.join("\n  - ")}`, "success");
+		});
 	});
 
 	pi.on("model_select", (event, ctx) => {
@@ -1308,6 +1841,13 @@ function notify(
 		if (model) runFixSafe(ctx, [model]);
 		// TTL-gated: hits the network only when a channel's signature is stale.
 		void runContextSyncSafe(ctx, false);
+		void runEffortProbeSafe(ctx, false);
+	});
+
+	// React to a rejected request parameter as Pi's auto-retry accepts 502 as
+	// retryable and will otherwise burn its attempts on the same bad level.
+	pi.on("message_end", (event, ctx) => {
+		handleInferenceError(event as { message?: { role?: string } }, ctx);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -1316,7 +1856,7 @@ function notify(
 
 	pi.registerCommand("auto-compat", {
 		description:
-			"Fix compat/thinkingLevelMap and sync contextWindow/maxTokens from each channel's /models endpoint",
+			"Fix compat/thinkingLevelMap, sync contextWindow/maxTokens from each channel's /models, and probe accepted thinking efforts",
 		handler: async (_args, ctx) => {
 			const targets = scanTargets(ctx);
 			// Force re-run even if already applied this session.
@@ -1333,7 +1873,9 @@ function notify(
 			// Forced: re-probe every channel regardless of TTL.
 			const sync = await runContextSyncSafe(ctx, true);
 			detail.push(...sync.detail.map((line) => `context sync: ${line}`));
-			if (changed || patched || sync.changed) {
+			const effort = await runEffortProbeSafe(ctx, true);
+			detail.push(...effort.detail.map((line) => `thinking effort: ${line}`));
+			if (changed || patched || sync.changed || effort.changed) {
 				notify(ctx, `fixed:\n  - ${detail.join("\n  - ")}`, "success");
 				return;
 			}
